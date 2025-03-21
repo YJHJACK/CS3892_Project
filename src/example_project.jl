@@ -21,10 +21,25 @@ function localize(gps_channel, imu_channel, localization_state_channel)
             meas = take!(imu_channel)
             push!(fresh_imu_meas, meas)
         end
-        
-        # process measurements
 
-        localization_state = MyLocalizationType(0,0.0)
+        # Process measurements - a simple placeholder using GPS data
+        if !isempty(fresh_gps_meas)
+            lat_sum = 0.0
+            lon_sum = 0.0
+            for m in fresh_gps_meas
+                lat_sum += m.lat
+                lon_sum += m.long
+            end
+            avg_lat = lat_sum / length(fresh_gps_meas)
+            avg_lon = lon_sum / length(fresh_gps_meas)
+
+            # Simple position estimation placeholder
+            # Change to EKF in the future
+            localization_state = MyLocalizationType(1, avg_lat + avg_lon)
+        else
+            localization_state = MyLocalizationType(0, 0.0)
+        end
+
         if isready(localization_state_channel)
             take!(localization_state_channel)
         end
