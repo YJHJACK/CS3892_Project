@@ -8,6 +8,13 @@ struct MyPerceptionType
     field2::Float64
 end
 
+mutable struct ObjectEKF
+    x::Vector{Float64}      # State: [x, y, vx, vy]
+    P::Matrix{Float64}      # Covariance
+    Q::Matrix{Float64}      # Process noise
+    R::Matrix{Float64}      # Measurement noise
+end
+
 function localize(gps_channel, imu_channel, localization_state_channel)
     # Set up algorithm / initialize variables
     while true
@@ -47,6 +54,25 @@ function localize(gps_channel, imu_channel, localization_state_channel)
     end 
 end
 
+function predict!(ekf::ObjectEKF, dt)
+    F = [1 0 dt 0;
+         0 1 0 dt;
+         0 0 1 0;
+         0 0 0 1]
+    ekf.x = F * ekf.x
+    ekf.P = F * ekf.P * F' + ekf.Q
+end
+
+function update!(ekf::ObjectEKF, z::Vector{Float64})
+    H = [1 0 0 0;
+         0 1 0 0]
+    y = z - H * ekf.x
+    S = H * ekf.P * H' + ekf.R
+    K = ekf.P * H' * inv(S)
+    ekf.x += K * y
+    ekf.P = (I - K * H) * ekf.P
+end
+
 function perception(cam_meas_channel, localization_state_channel, perception_state_channel)
     # set up stuff
     while true
@@ -59,8 +85,24 @@ function perception(cam_meas_channel, localization_state_channel, perception_sta
         latest_localization_state = fetch(localization_state_channel)
         
         # process bounding boxes / run ekf / do what you think is good
+        # Simulated detection: assume bounding box center gives object (x, y)
+        if !isempty(fresh_cam_meas)
+            # Use the most recent camera measurement (e.g., Dict(:x, :y))
+            meas = fresh_cam_meas[end]
+            z = [meas[:x], meas[:y]]
 
-        perception_state = MyPerceptionType(0,0.0)
+            # Run EKF prediction and update
+            dt = time() - last_time
+            last_time = time()
+            predict!(ekf, dt)
+            update!(ekf, z)
+        end
+
+        # Create output state using estimated x-position and x-velocity
+        estimated_x = ekf.x[1]
+        estimated_vx = ekf.x[3]
+        perception_state = MyPerceptionType(round(Int, estimated_x), estimated_vx)
+
         if isready(perception_state_channel)
             take!(perception_state_channel)
         end
