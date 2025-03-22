@@ -111,22 +111,43 @@ function perception(cam_meas_channel, localization_state_channel, perception_sta
 end
 
 function decision_making(localization_state_channel, 
-        perception_state_channel, 
-        map, 
-        target_road_segment_id, 
-        socket)
-    # do some setup
+    perception_state_channel, 
+    map, 
+    target_road_segment_id, 
+    socket)
+    # Simple reactive control
     while true
         latest_localization_state = fetch(localization_state_channel)
         latest_perception_state = fetch(perception_state_channel)
 
-        # figure out what to do ... setup motion planning problem etc
+        # Default commands
         steering_angle = 0.0
         target_vel = 0.0
-        cmd = (steering_angle, target_vel, true)
+        keep_driving = false
+
+        # Only move if we are localized
+        if latest_localization_state.field1 == 1
+            # If we "see" something (basic perception cue), maybe slow down
+            if latest_perception_state.field1 == 1
+                target_vel = 1.0  # slow
+                keep_driving = false  # stop and wait (or could swerve later)
+            else
+                target_vel = 5.0  # arbitrary cruising speed
+                keep_driving = true
+            end
+        else
+            @warn "Localization not ready, vehicle staying stopped"
+        end
+
+        # Dummy logic for future: use map + target_road_segment_id for planning
+
+        cmd = (steering_angle, target_vel, keep_driving)
         serialize(socket, cmd)
+
+        sleep(0.05)  # Send commands at 20Hz
     end
 end
+
 
 function isfull(ch::Channel)
     length(ch.data) ≥ ch.sz_max
