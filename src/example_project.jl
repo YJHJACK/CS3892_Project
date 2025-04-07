@@ -19,6 +19,8 @@ struct MyLocalizationType
     timestamp::Float64                  # time of the estimate
 end
 
+export MyLocalizationType
+
 struct Detected_Obj
     id::int  # id for each object
     bbox::NTuple{4, Float64}           # Bounding box: (x_min, y_min, x_max, y_max).
