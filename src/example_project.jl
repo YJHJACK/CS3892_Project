@@ -1,6 +1,10 @@
 struct MyLocalizationType
-    field1::Int
-    field2::Float64
+    valid::Bool                         # indicates if the estimate is valid
+    position::SVector{3,Float64}        # x, y, z coordinates
+    yaw::Float64                        # heading angle
+    velocity::SVector{3,Float64}        # velocity vector
+    covariance::Matrix{Float64}         # uncertainty matrix
+    timestamp::Float64                  # time of the estimate
 end
 
 struct MyPerceptionType
@@ -15,43 +19,194 @@ mutable struct ObjectEKF
     R::Matrix{Float64}      # Measurement noise
 end
 
+# EKF Localization Function: Fuse IMU and GPS Data
 function localize(gps_channel, imu_channel, localization_state_channel)
-    # Set up algorithm / initialize variables
+    x = zeros(13)
+    x[4] = 1.0
+    
+    # Covariance matrix initialization which is the tuned initial uncertainty
+    P = 0.1 * Matrix{Float64}(I, 13, 13)
+    # Process noise covariance Q reflecting model inaccuracies and IMU noise
+    Q = 0.001 * Matrix{Float64}(I, 13, 13)
+    
+    # Base GPS measurement noise covariance to be adjusted adaptively
+    base_R = Diagonal([1.0, 1.0, 0.1])
+    adaptive_factor = 1.0  # Initial adaptive factor
+    R_gps = adaptive_factor * base_R
+
+    # Record the last timestamp from the IMU measurements
+    last_time = time()
+
     while true
-        fresh_gps_meas = []
-        while isready(gps_channel)
-            meas = take!(gps_channel)
-            push!(fresh_gps_meas, meas)
-        end
-        fresh_imu_meas = []
+        # (a) Prediction Step
+        # Process IMU Measurements
+        imu_measurements = Vector{IMUMeasurement}()
         while isready(imu_channel)
-            meas = take!(imu_channel)
-            push!(fresh_imu_meas, meas)
+            push!(imu_measurements, take!(imu_channel))
         end
-
-        # Process measurements - a simple placeholder using GPS data
-        if !isempty(fresh_gps_meas)
-            lat_sum = 0.0
-            lon_sum = 0.0
-            for m in fresh_gps_meas
-                lat_sum += m.lat
-                lon_sum += m.long
+        for imu_meas in imu_measurements
+            # Compute time difference dt
+            dt = imu_meas.time - last_time
+            if dt <= 0
+                dt = 0.001
             end
-            avg_lat = lat_sum / length(fresh_gps_meas)
-            avg_lon = lon_sum / length(fresh_gps_meas)
-
-            # Simple position estimation placeholder
-            # Change to EKF in the future
-            localization_state = MyLocalizationType(1, avg_lat + avg_lon)
-        else
-            localization_state = MyLocalizationType(0, 0.0)
+            last_time = imu_meas.time
+            
+            # Build control vector u = [linear_vel; angular_vel]
+            u = vcat(collect(imu_meas.linear_vel), collect(imu_meas.angular_vel))
+            
+            # Prediction
+            # update state with process model f_ekf and Jacobian Jac_x_f_ekf
+            x_pred = f_ekf(x, dt, u)
+            F = Jac_x_f_ekf(x, dt, u)
+            # Update covariance: P = F P Fᵀ + Q
+            P = F * P * transpose(F) + Q
+            x = x_pred
         end
+        
+        # (b) Correction Step
+        # Process GPS Measurements
+        gps_measurements = Vector{GPSMeasurement}()
+        while isready(gps_channel)
+            push!(gps_measurements, take!(gps_channel))
+        end
+        if !isempty(gps_measurements)
+            # Use the latest GPS measurement for correction
+            gps_meas = gps_measurements[end]
+            # Construct measurement vector: z = [lat; long; heading]
+            z = [gps_meas.lat; gps_meas.long; gps_meas.heading]
+            # Predict the GPS measurement based on current state using h_gps
+            z_pred = h_gps(x)
+            # Compute the innovation (measurement residual)
+            y = z - z_pred
+            # Get the measurement Jacobian H using Jac_h_gps
+            H = Jac_h_gps(x)
+            
+            # Adaptive noise adjustment: increase GPS noise if innovation is too large
+            if norm(y) > 2.0
+                adaptive_factor *= 1.05
+            else
+                adaptive_factor = max(adaptive_factor * 0.95, 1.0)
+            end
+            R_gps = adaptive_factor * base_R
+            
+            # Compute innovation covariance: S = H P Hᵀ + R_gps
+            S = H * P * transpose(H) + R_gps
+            # Calculate Kalman gain: K = P Hᵀ S⁻¹
+            K = P * transpose(H) * inv(S)
+            # Update the state estimate: x = x + K y
+            x = x + K * y
+            # Update the covariance: P = (I - K H) P
+            P = (I - K * H) * P
+        end
+        
+        # Extract complete state information
+        position = SVector(x[1], x[2], x[3])
+        yaw = extract_yaw_from_quaternion(x[4:7])
+        velocity = SVector(x[8], x[9], x[10])
+        current_time = time()
 
+        # Construct the updated localization state message
+        localization_state = MyLocalizationType(true, position, yaw, velocity, P, current_time)
         if isready(localization_state_channel)
             take!(localization_state_channel)
         end
         put!(localization_state_channel, localization_state)
-    end 
+        
+        sleep(0.001)  # Control loop frequency
+    end
+end
+
+# Helper function for loalization: Quaternion Multiplication
+function quaternion_multiply(q1::AbstractVector{T}, q2::AbstractVector{T}) where T
+    # q1 = [w1, x1, y1, z1], q2 = [w2, x2, y2, z2]
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    w = w1*w2 - x1*x2 - y1*y2 - z1*z2
+    x = w1*x2 + x1*w2 + y1*z2 - z1*y2
+    y = w1*y2 - x1*z2 + y1*w2 + z1*x2
+    z = w1*z2 + x1*y2 - y1*x2 + z1*w2
+    return SVector(w, x, y, z)
+end
+
+# EKF Process Model using IMU Measurements
+function f_ekf(x::Vector{Float64}, dt::Float64, u::Vector{Float64})
+    # State vector x = [position (3); quaternion (4); velocity (3); angular velocity (3)]
+    pos   = x[1:3]
+    quat  = x[4:7]
+    # Control vector u = [linear_vel (3); angular_vel (3)] from the IMU measurement
+    v_meas = u[1:3]
+    ω_meas = u[4:6]
+    
+    # Update position
+    # new_pos = pos + dt * R(quat) * v_meas
+    R_mat = Rot_from_quat(quat)
+    new_pos = pos + dt * (R_mat * v_meas)
+    
+    # Update attitude
+    # Use quaternion integration
+    norm_ω = norm(ω_meas)
+    if norm_ω < 1e-5
+        delta_q = SVector(1.0, 0.0, 0.0, 0.0)
+    else
+        theta = norm_ω * dt
+        axis = ω_meas / norm_ω
+        delta_q = SVector(cos(theta/2), sin(theta/2)*axis[1], sin(theta/2)*axis[2], sin(theta/2)*axis[3])
+    end
+    new_quat = quaternion_multiply(quat, delta_q)
+    new_quat = new_quat / norm(new_quat)  # Normalize the quaternion
+
+    # Update velocity and angular velocity:
+    # For this implementation, we assume that the measured values are directly used.
+    new_vel = v_meas
+    new_ω   = ω_meas
+    
+    # Return the updated state vector (13-dimensional)
+    return vcat(new_pos, new_quat, new_vel, new_ω)
+end
+
+# EKF Process Model Jacobian with Respect to the State
+function Jac_x_f_ekf(x::Vector{Float64}, dt::Float64, u::Vector{Float64})
+    A = zeros(13,13)
+    # State x = [position (3); quaternion (4); velocity (3); angular velocity (3)]
+    
+    # 1. Partial derivative of new position with respect to position is I(3)
+    A[1:3,1:3] .= I(3)
+    
+    # 2. Partial derivative of new position with respect to quaternion
+    # new_pos = pos + dt * R(quat) * v_meas
+    # Use the provided function J_R_q to get derivatives of R with respect to each quaternion component.
+    dR_tuple = J_R_q(x[4:7])  # Tuple of four 3×3 matrices.
+    for i in 1:4
+        A[1:3, 3+i] = dt * (dR_tuple[i] * u[1:3])
+    end
+    
+    # 3. Partial derivative of the quaternion update with respect to quaternion
+    # new_quat = quaternion_multiply(q, delta_q)
+    # Approximate the derivative using the left-multiplication matrix L(delta_q).
+    ω_meas = u[4:6]
+    norm_ω = norm(ω_meas)
+    if norm_ω < 1e-5
+        delta_q = SVector(1.0, 0.0, 0.0, 0.0)
+    else
+        theta = norm_ω * dt
+        delta_q = SVector(cos(theta/2),
+                          sin(theta/2)*(ω_meas[1]/norm_ω),
+                          sin(theta/2)*(ω_meas[2]/norm_ω),
+                          sin(theta/2)*(ω_meas[3]/norm_ω))
+    end
+    L_delta = [
+      delta_q[1]  -delta_q[2]  -delta_q[3]  -delta_q[4];
+      delta_q[2]   delta_q[1]   delta_q[4]  -delta_q[3];
+      delta_q[3]  -delta_q[4]   delta_q[1]   delta_q[2];
+      delta_q[4]   delta_q[3]  -delta_q[2]   delta_q[1]
+    ]
+    A[4:7,4:7] = L_delta
+    
+    # 4. For velocity and angular velocity, the state is directly replaced by the measurement,
+    # so the partial derivatives with respect to the state are zero.
+    
+    return A
 end
 
 function EKF_predict!(ekf::ObjectEKF, dt)
