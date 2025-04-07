@@ -1,3 +1,15 @@
+using DataStructures
+using StaticArrays
+using Interpolations
+
+struct PIDController
+    kp::Float64
+    ki::Float64
+    kd::Float64
+    integral::Float64
+    last_error::Float64
+end
+
 struct MyLocalizationType
     valid::Bool                         # indicates if the estimate is valid
     position::SVector{3,Float64}        # x, y, z coordinates
@@ -17,6 +29,95 @@ mutable struct ObjectEKF
     P::Matrix{Float64}      # Covariance
     Q::Matrix{Float64}      # Process noise
     R::Matrix{Float64}      # Measurement noise
+end
+
+# Update function: updates PID
+function PID_update!(pid::PIDController, error, dt)
+    pid.integral += error * dt
+    derivative = (error - pid.last_error) / dt
+    pid.last_error = error
+    return pid.kp * error + pid.ki * pid.integral + pid.kd * derivative
+end
+
+# Lane generator: generates a list of lanes (least number) that the ego will pass in order from the beginning to the destination
+function least_lane_path(all_segs::Dict{Int,RoadSegment}, start_id::Int, goal_id::Int)
+    # Use a queue for a breadth-first search.
+    queue = Queue{Int}()
+    enqueue!(queue, start_id)
+    
+    # Dictionary to record the predecessor for each segment.
+    came_from = Dict{Int,Int}()
+    
+    # Set to track visited segments.
+    visited = Set{Int}([start_id])
+    
+    while !isempty(queue)
+        current = dequeue!(queue)
+        if current == goal_id
+            # Reconstruct the path by walking backwards.
+            path = [current]
+            while haskey(came_from, current)
+                current = came_from[current]
+                push!(path, current)
+            end
+            return reverse(path)
+        end
+        
+        # For each neighbor reachable from this segment.
+        for neighbor in all_segs[current].children
+            if neighbor ∉ visited
+                push!(visited, neighbor)
+                came_from[neighbor] = current
+                enqueue!(queue, neighbor)
+            end
+        end
+    end
+    error("No path found from segment $start_id to segment $goal_id")
+end
+
+function decision_making(localization_state_channel, perception_state_channel, map, target_road_segment_id, socket)
+    # Setup a PID controller for steering.
+    pid = PIDController(2.0, 0.1, 0.5, 0.0, 0.0)
+    dt = 0.1  # time step (seconds)
+    
+    # Assume the current segment ID is known (here hard-coded for simplicity).
+    current_segment_id = 1
+    
+    # Compute the route and generate a reference trajectory.
+    route = least_lane_path(map, current_segment_id, target_road_segment_id)
+    route_segments = [map[id] for id in route]
+    trajectory = generate_trajectory_plan_with_curvature(route_segments, 200)
+    
+    while true
+        # Get the latest states.
+        loc = fetch(localization_state_channel)       # Should include loc.pos and loc.yaw
+        perc = fetch(perception_state_channel)          # Should include perc.obstacles (array of objects with pos)
+        
+        # Choose a lookahead point on the trajectory.
+        lookahead_idx = min(length(trajectory), 10)
+        desired_point = trajectory[lookahead_idx]
+        
+        # Compute the error vector.
+        error_vec = desired_point - loc.pos
+        distance_error = norm(error_vec)
+        desired_heading = atan(error_vec[2], error_vec[1])
+        heading_error = desired_heading - loc.yaw
+        
+        # Use the PID controller to compute a steering command.
+        steering_command = PID_update!(pid, heading_error, dt)
+        
+        # Compute a planned target velocity (e.g., proportional to distance error).
+        planned_velocity = 1.0 * distance_error
+        
+        # Adjust the planned velocity based on collision avoidance logic.
+        safe_velocity = collision_avoidance_control(loc, perc, planned_velocity)
+        
+        # Form the control command. The structure could be (steering, velocity, flag).
+        cmd = (steering_command, safe_velocity, true)
+        serialize(socket, cmd)
+        
+        sleep(dt)
+    end
 end
 
 # EKF Localization Function: Fuse IMU and GPS Data
