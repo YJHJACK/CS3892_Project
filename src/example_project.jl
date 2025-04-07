@@ -39,6 +39,36 @@ function PID_update!(pid::PIDController, error, dt)
     return pid.kp * error + pid.ki * pid.integral + pid.kd * derivative
 end
 
+# Helper function: prevents collision
+function collision_avoidance_control(ego_state, perception_state, planned_velocity)
+    # Define a safety distance (in meters)
+    safety_distance = 8.0
+    
+    # Initialize the adjusted velocity with the planned value
+    adjusted_velocity = planned_velocity
+    
+    # Assume perception_state.obstacles is a vector of obstacles, each with a 'pos' field.
+    # Here, we check only obstacles that are ahead (in the vehicle's forward direction).
+    for obs in perception_state.obstacles
+        # Compute the vector from ego to obstacle
+        relative_vec = obs.pos - ego_state.pos
+        
+        # Project the relative vector on the vehicle's heading (using ego_state.yaw)
+        # Compute the unit vector in the direction of ego heading:
+        forward = SVector(cos(ego_state.yaw), sin(ego_state.yaw))
+        # Calculate how far ahead the obstacle is:
+        distance_ahead = dot(relative_vec, forward)
+        
+        # If the obstacle is ahead and closer than the safety distance:
+        if distance_ahead > 0 && distance_ahead < safety_distance
+            # Reduce the target velocity (for instance, to zero or a low speed)
+            adjusted_velocity = min(adjusted_velocity, 0.0)
+        end
+    end
+    
+    return adjusted_velocity
+end
+
 # Lane generator: generates a list of lanes (least number) that the ego will pass in order from the beginning to the destination
 function least_lane_path(all_segs::Dict{Int,RoadSegment}, start_id::Int, goal_id::Int)
     # Use a queue for a breadth-first search.
@@ -78,47 +108,58 @@ end
 function decision_making(localization_state_channel, perception_state_channel, map, target_road_segment_id, socket)
     # Setup a PID controller for steering.
     pid = PIDController(2.0, 0.1, 0.5, 0.0, 0.0)
-    dt = 0.1  # time step (seconds)
-    
-    # Assume the current segment ID is known (here hard-coded for simplicity).
+    dt = 0.1  # time step in seconds
+
+    # For simplicity, we assume the current segment is known.
     current_segment_id = 1
-    
+
     # Compute the route and generate a reference trajectory.
     route = least_lane_path(map, current_segment_id, target_road_segment_id)
     route_segments = [map[id] for id in route]
     trajectory = generate_trajectory_plan_with_curvature(route_segments, 200)
-    
+
     while true
-        # Get the latest states.
-        loc = fetch(localization_state_channel)       # Should include loc.pos and loc.yaw
-        perc = fetch(perception_state_channel)          # Should include perc.obstacles (array of objects with pos)
+        # Get the latest localization state.
+        loc = fetch(localization_state_channel)
+        # If the localization estimate is not valid, wait.
+        if !loc.valid
+            sleep(dt)
+            continue
+        end
+        
+        # Extract the current 2D position from the 3D position.
+        current_pos = loc.position[1:2]
+        
+        # Get the latest perception state.
+        perc = fetch(perception_state_channel)
         
         # Choose a lookahead point on the trajectory.
         lookahead_idx = min(length(trajectory), 10)
         desired_point = trajectory[lookahead_idx]
         
-        # Compute the error vector.
-        error_vec = desired_point - loc.pos
+        # Compute error vector (only in 2D).
+        error_vec = desired_point - current_pos
         distance_error = norm(error_vec)
         desired_heading = atan(error_vec[2], error_vec[1])
         heading_error = desired_heading - loc.yaw
         
-        # Use the PID controller to compute a steering command.
-        steering_command = PID_update!(pid, heading_error, dt)
+        # Compute the steering command using the PID controller.
+        steering_command = update!(pid, heading_error, dt)
         
-        # Compute a planned target velocity (e.g., proportional to distance error).
+        # Compute a planned target velocity (for instance, proportional to the distance error).
         planned_velocity = 1.0 * distance_error
         
-        # Adjust the planned velocity based on collision avoidance logic.
+        # Adjust the planned velocity based on collision avoidance.
         safe_velocity = collision_avoidance_control(loc, perc, planned_velocity)
         
-        # Form the control command. The structure could be (steering, velocity, flag).
+        # Form the control command (steering, velocity, flag).
         cmd = (steering_command, safe_velocity, true)
         serialize(socket, cmd)
         
         sleep(dt)
     end
 end
+
 
 # EKF Localization Function: Fuse IMU and GPS Data
 function localize(gps_channel, imu_channel, localization_state_channel)
