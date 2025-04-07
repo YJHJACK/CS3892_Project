@@ -19,9 +19,20 @@ struct MyLocalizationType
     timestamp::Float64                  # time of the estimate
 end
 
+struct Detected_Obj
+    id::int  # id for each object
+    bbox::NTuple{4, Float64}           # Bounding box: (x_min, y_min, x_max, y_max).
+    confidence::Float64                # Confidence score from the CNN.
+    classification::String             # e.g., "vehicle", "pedestrian"
+    position::SVector{2, Float64}      # Estimated 2D position (from EKF fusion).
+    velocity::SVector{2, Float64}      # Estimated 2D velocity (if available).
+    uncertainty::Matrix{Float64}       # Covariance of the position estimate.
+    sensor_source::String              # e.g., "camera", "lidar"
+end
+
 struct MyPerceptionType
-    field1::Int
-    field2::Float64
+    timestamp::Int
+    Detected_Obj::Float64
 end
 
 mutable struct ObjectEKF
