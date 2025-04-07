@@ -54,7 +54,7 @@ function localize(gps_channel, imu_channel, localization_state_channel)
     end 
 end
 
-function predict!(ekf::ObjectEKF, dt)
+function EKF_predict!(ekf::ObjectEKF, dt)
     F = [1 0 dt 0;
          0 1 0 dt;
          0 0 1 0;
@@ -63,7 +63,7 @@ function predict!(ekf::ObjectEKF, dt)
     ekf.P = F * ekf.P * F' + ekf.Q
 end
 
-function update!(ekf::ObjectEKF, z::Vector{Float64})
+function EKF_update!(ekf::ObjectEKF, z::Vector{Float64})
     H = [1 0 0 0;
          0 1 0 0]
     y = z - H * ekf.x
@@ -94,8 +94,8 @@ function perception(cam_meas_channel, localization_state_channel, perception_sta
             # Run EKF prediction and update
             dt = time() - last_time
             last_time = time()
-            predict!(ekf, dt)
-            update!(ekf, z)
+            EKF_predict!(ekf, dt)
+            EKF_update!(ekf, z)
         end
 
         # Create output state using estimated x-position and x-velocity
