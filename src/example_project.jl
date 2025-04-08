@@ -1,6 +1,11 @@
 using DataStructures
 using StaticArrays
 using Interpolations
+using PyCall
+
+#add cnn model
+py_model_module = pyimport("cnn")
+cnn_model = py_model_module.load_model("path")
 
 struct PIDController
     kp::Float64
@@ -383,8 +388,10 @@ function EKF_update!(ekf::ObjectEKF, z::Vector{Float64})
     ekf.P = (I - K * H) * ekf.P
 end
 
-function perception(cam_meas_channel, localization_state_channel, perception_state_channel)
+#EKF perception function, also use CNN model
+function perception(cam_meas_channel, localization_state_channel, perception_state_channel, ekf, cnn_model; confidence_threshold=0.5)
     # set up stuff
+    last_time = time()
     while true
         fresh_cam_meas = []
         while isready(cam_meas_channel)
@@ -399,24 +406,38 @@ function perception(cam_meas_channel, localization_state_channel, perception_sta
         if !isempty(fresh_cam_meas)
             # Use the most recent camera measurement (e.g., Dict(:x, :y))
             meas = fresh_cam_meas[end]
-            z = [meas[:x], meas[:y]]
+            image = cam_meas[:image]
+            
+             # Run the CNN to get detections (each detection could be a Dict with :x, :y, :confidence)
+            cnn_detections = cnn_model(image)
 
-            # Run EKF prediction and update
-            dt = time() - last_time
-            last_time = time()
-            EKF_predict!(ekf, dt)
-            EKF_update!(ekf, z)
+            # Process each detection
+            for detection in cnn_detections
+                if detection[:confidence] > confidence_threshold
+                    # Convert CNN output (e.g., pixel coordinates) to world coordinates if needed.
+                    # For simplicity, assume detection[:x] and detection[:y] are already in world units.
+                    z = [detection[:x], detection[:y]]
+                    
+                    # Compute time difference for EKF prediction
+                    dt = time() - last_time
+                    last_time = time()
+                    
+                    # Run EKF prediction and update using the detection measurement.
+                    EKF_predict!(ekf, dt)
+                    EKF_update!(ekf, z)
+                end
+            end
+
+            # After processing detections, generate the perception state.
+            estimated_x = ekf.x[1]
+            estimated_vx = ekf.x[3]
+            perception_state = MyPerceptionType(round(Int, estimated_x), estimated_vx)
+            
+            if isready(perception_state_channel)
+                take!(perception_state_channel)
+            end
+            put!(perception_state_channel, perception_state)
         end
-
-        # Create output state using estimated x-position and x-velocity
-        estimated_x = ekf.x[1]
-        estimated_vx = ekf.x[3]
-        perception_state = MyPerceptionType(round(Int, estimated_x), estimated_vx)
-
-        if isready(perception_state_channel)
-            take!(perception_state_channel)
-        end
-        put!(perception_state_channel, perception_state)
     end
 end
 
