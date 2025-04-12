@@ -494,6 +494,61 @@ function initialize_particles(quat_loc_minerror_list; var_location=0.5,var_angle
     return particles
 end
 
+function update_particles(particles::Vector{Particle},
+                          delta_t::Float64,
+                          obj_bboxes_cam1::Vector{NTuple{4,Float64}},
+                          obj_bboxes_cam2::Vector{NTuple{4,Float64}},
+                          ego_orientation::Float64,
+                          ego_position::SVector{2,Float64},
+                          T_body_camrot1,
+                          T_body_camrot2,
+                          image_width::Int,
+                          image_height::Int,
+                          pixel_len::Float64)
+    # 遍历每个粒子进行更新
+    for i in 1:length(particles)
+        p = particles[i]
+        # 1. 使用简单运动模型更新粒子位置
+        dx = p.v * cos(p.angle) * delta_t
+        dy = p.v * sin(p.angle) * delta_t
+        new_loc = p.loc + SVector(dx, dy)
+        # 加入小的过程噪声
+        noise_std = 0.05
+        new_loc += SVector(randn()*noise_std, randn()*noise_std)
+        # 粒子朝向也加一点随机扰动
+        new_angle = p.angle + randn()*0.01
+        
+        # 2. 根据更新后的状态投影到图像平面
+        quat_new = yaw_to_quaternion(new_angle)
+        # 对两个摄像头分别计算预测边界框（这里只取第一个预测结果）
+        pred_bboxes_cam1 = predict_bboxes(quat_new, new_loc, T_body_camrot1, image_width, image_height, pixel_len)
+        pred_bboxes_cam2 = predict_bboxes(quat_new, new_loc, T_body_camrot2, image_width, image_height, pixel_len)
+        
+        # 3. 计算预测边界框与观测到的边界框误差
+        error1 = bboxes_error(pred_bboxes_cam1, obj_bboxes_cam1)
+        error2 = bboxes_error(pred_bboxes_cam2, obj_bboxes_cam2)
+        total_error = error1 + error2
+        
+        # 4. 利用高斯似然更新权重，误差越大权重越小
+        sigma = 20.0  # 测量噪声标准差（像素），根据实际情况调整
+        likelihood = exp(-0.5 * (total_error/sigma)^2)
+        
+        # 更新粒子状态和权重
+        particles[i] = Particle(new_angle, new_loc, p.v, likelihood)
+    end
+    
+    # 5. 对所有粒子权重进行归一化
+    total_weight = sum(p -> p.w, particles)
+    if total_weight > 0
+        for i in 1:length(particles)
+            p = particles[i]
+            particles[i] = Particle(p.angle, p.loc, p.v, p.w / total_weight)
+        end
+    end
+
+    return particles
+end
+
 function estimate_object_state(ego_state, obj_bboxes::Vector{NTuple{4,Float64}}; scale_factor=0.01)
     # 检查是否有边界框数据
     if isempty(obj_bboxes)
@@ -541,27 +596,57 @@ function perception(cam_meas_channel, localization_state_channel, perception_sta
             push!(fresh_cam_meas, meas)
         end
 
-        latest_localization_state = fetch(localization_state_channel)
-        detected_objects = Vector{DetectedObject}()
-        
-        # process bounding boxes / run ekf / do what you think is good
-        # Simulated detection: assume bounding box center gives object (x, y)
-        if !isempty(fresh_cam_meas)
-            # Use the most recent camera measurement (e.g., Dict(:x, :y))
-            meas = fresh_cam_meas[end]
-            z = [meas[:x], meas[:y]]
+        true_bboxes_cam1 = haskey(cam_meas, :bboxes_cam1) ? cam_meas[:bboxes_cam1] : []
+    true_bboxes_cam2 = haskey(cam_meas, :bboxes_cam2) ? cam_meas[:bboxes_cam2] : []
 
-            # Run EKF prediction and update
-            dt = time() - last_time
-            last_time = time()
-            EKF_predict!(ekf, dt)
-            EKF_update!(ekf, z)
-        end
+    # 计算目标估计区域（基于两个摄像头边界框）
+    best_center, half_w, half_y, quat_loc_minerror_list =
+        estimate_location_from_2_bboxes(ego_orientation, ego_position,
+                                        T_body_camrot1, T_body_camrot2,
+                                        vehicle_size, image_width, image_height, pixel_len,
+                                        true_bboxes_cam1, true_bboxes_cam2;
+                                        step=candidate_step)
+    # best_center 为 3D 位置，如 (x, y, z)
+    # quat_loc_minerror_list 为候选解列表：每个元素 (candidate_quat, candidate_loc, total_error)
 
-        # Create output state using estimated x-position and x-velocity
-        estimated_x = ekf.x[1]
-        estimated_vx = ekf.x[3]
-        perception_state = MyPerceptionType(round(Int, estimated_x), estimated_vx)
+    # 可以将候选解列表进一步筛选出误差较小的一部分作为初始化依据
+    # 例如，取误差最小的 10 个候选
+    sorted_candidates = sort(quat_loc_minerror_list, by = x -> x[3])
+    selected_candidates = sorted_candidates[1:min(10, length(sorted_candidates))]
+
+    # 初始化粒子
+    particles = initializa_particles(selected_candidates, vehicle_size;
+                                     varangle = pi/12, var_location = 0.5, 
+                                     max_v = 7.5, step_v = 0.5, number_of_particles = 1000)
+    
+    # 对单个目标进行精确估计（利用目标边界框数据）
+    if !isempty(true_bboxes_cam1)
+        obj_bboxes = [true_bboxes_cam1[1]]  # 转换为数组形式
+        est_obj_ori, est_obj_loc = estimate_object_state(ego_state, obj_bboxes; scale_factor=pixel_len)
+    else
+        # 若没有检测到目标，则默认为 ego 状态
+        est_obj_ori = ego_orientation
+        est_obj_loc = ego_position
+    end
+
+    # 将该检测结果封装为 DetectedObject
+    detected_object = DetectedObject(1, est_obj_ori, est_obj_loc, true_bboxes_cam1 != [] ? true_bboxes_cam1[1] : (0.0,0.0,0.0,0.0))
+    
+    # 根据时间更新粒子 (例如下一帧中调用 update_particles 进行更新)
+    delta_t = time() - last_time
+    updated_particles = update_particles(particles, delta_t,
+                                         true_bboxes_cam1, true_bboxes_cam2,
+                                         ego_orientation, ego_position,
+                                         T_body_camrot1, T_body_camrot2,
+                                         image_width, image_height, pixel_len)
+
+    # 整体构造感知消息
+    # 将估计的目标区域（例如 best_center 周围一定范围作为区域信息）以及
+    # 精确估计的目标状态封装到感知消息中
+    margin = 1.0  # 可根据 half_w, half_y 设定更合理的值
+    estimated_region = (best_center[1]-margin, best_center[2]-margin,
+                        best_center[1]+margin, best_center[2]+margin)
+    perception_msg = MyPerceptionType(time(), [detected_object], estimated_region)
 
         if isready(perception_state_channel)
             take!(perception_state_channel)
