@@ -31,6 +31,13 @@ struct Detected_Obj
     velocity::SVector{2, Float64}      # Estimated 2D velocity (if available).
 end
 
+struct Particle
+    angle::Float64            # 朝向角
+    loc::SVector{2,Float64}   # 位置
+    v::Float64                # 速度
+    w::Float64                # 粒子权重
+end
+
 struct MyPerceptionType
     timestamp::Int
     Detected_Obj::Float64
@@ -382,7 +389,148 @@ function EKF_update!(ekf::ObjectEKF, z::Vector{Float64})
     ekf.P = (I - K * H) * ekf.P
 end
 
-#EKF perception function, also use CNN model
+#given quaternion, location, bboxes from 2 cams, return estimated location region
+function estimate_location_region(ego_quaternion::SVector{4,Float64},
+                                  ego_position::SVector{3,Float64},
+                                  T_body_camrot1, T_body_camrot2,
+                                  true_bboxes_cam1::Vector{NTuple{4,Float64}},
+                                  true_bboxes_cam2::Vector{NTuple{4,Float64}})
+    quat_loc_bboxerror_list = []
+    base_yaw = quaternion_to_yaw(ego_quaternion)
+    for dyaw in range(-0.3, 0.3, length=5)   # 在 base_yaw 附近 ±0.3 弧度
+        for dx in range(-1.0, 1.0, length=5) # 在 ego_position 附近 ±1.0 米
+            for dy in range(-1.0, 1.0, length=5)
+                # 构造一个候选四元数
+                candidate_yaw = base_yaw + dyaw
+                candidate_quat = yaw_to_quaternion(candidate_yaw)
+                # 构造一个候选位置
+                candidate_loc = SVector(ego_position[1] + dx,
+                                        ego_position[2] + dy,
+                                        ego_position[3])
+
+                # 2. 根据候选 (candidate_quat, candidate_loc) 预测在两个摄像头的投影边界框
+                pred_bboxes_cam1 = predict_bboxes_from_pose(candidate_quat, candidate_loc, T_body_camrot1)
+                pred_bboxes_cam2 = predict_bboxes_from_pose(candidate_quat, candidate_loc, T_body_camrot2)
+
+                # 3. 计算与真实检测的边界框误差
+                #    这里假设你只关心每个摄像头的第一个 bbox（或根据需求匹配多个 bbox）
+                cam1_error = bboxes_error(pred_bboxes_cam1, true_bboxes_cam1)
+                cam2_error = bboxes_error(pred_bboxes_cam2, true_bboxes_cam2)
+                total_error = cam1_error + cam2_error
+
+                # 4. 将结果存入数组
+                push!(quat_loc_bboxerror_list, (candidate_quat, candidate_loc, total_error))
+            end
+        end
+    end
+
+    # 5. 根据 total_error 寻找误差最小的候选
+    sort!(quat_loc_bboxerror_list, by = x->x[3])  # x[3] 即 total_error
+    best_candidate = first(quat_loc_bboxerror_list)
+    best_quat   = best_candidate[1]
+    best_loc    = best_candidate[2]
+    min_error   = best_candidate[3]
+
+    # 例如返回一个“区域”，简单起见可以认为在 best_loc 附近 ±1 m
+    margin = 1.0
+    estimated_region = (best_loc[1] - margin, best_loc[2] - margin,
+                        best_loc[1] + margin, best_loc[2] + margin)
+
+    return best_quat, best_loc, min_error, estimated_region
+end
+
+function initialize_particles(quat_loc_minerror_list; var_location=0.5,var_angle=pi/12,v_max=7.5,step_v=0.5,number_of_particles=1000)
+    if isempty(quat_loc_minerror_list)
+        error("quat_loc_minerror_list 为空，无法初始化粒子！")
+    end
+
+    # 平均分配给每个候选解的粒子数（若有小数，向上取整）
+    avg_num = max(1, ceil(Integer, number_of_particles / length(quat_loc_minerror_list)))
+
+    particles = Particle[]
+    total_created = 0
+
+    for (quat, loc, min_err) in quat_loc_minerror_list
+        # 1. 将四元数转为航向角（若只考虑航向）
+        base_angle = quaternion_to_yaw(quat)
+
+        # 2. 设定多元正态分布的均值和协方差矩阵
+        #    mean = [ base_angle, loc[1], loc[2] ]
+        #    cov  = diagm([var_angle^2, var_location^2, var_location^2])
+        mu = [base_angle, loc[1], loc[2]]
+        cov = Matrix{Float64}(I, 3, 3)
+        cov[1,1] = var_angle^2
+        cov[2,2] = var_location^2
+        cov[3,3] = var_location^2
+        multi_normal = MvNormal(mu, cov)
+
+        # 3. 从该分布中采样 avg_num 个粒子
+        for i in 1:avg_num
+            sample = rand(multi_normal)
+            # sample[1] -> 粒子的 angle
+            # sample[2] -> x
+            # sample[3] -> y
+            θ = sample[1]
+            x = sample[2]
+            y = sample[3]
+            # 随机给一个速度
+            possible_v = collect(0:step_v:v_max)
+            v = rand(possible_v)
+            # 初始权重可均分
+            w = 1.0 / number_of_particles
+
+            push!(particles, Particle(θ, SVector(x,y), v, w))
+            total_created += 1
+            if total_created >= number_of_particles
+                break
+            end
+        end
+
+        if total_created >= number_of_particles
+            break
+        end
+    end
+
+    return particles
+end
+
+function estimate_object_state(ego_state, obj_bboxes::Vector{NTuple{4,Float64}}; scale_factor=0.01)
+    # 检查是否有边界框数据
+    if isempty(obj_bboxes)
+        error("没有检测到目标边界框数据！")
+    end
+
+    # 取第一帧（或只取最可靠的一个），也可对多个进行平均
+    bbox = obj_bboxes[1]
+    # 计算边界框中心（单位：像素）
+    center_pixel = bbox_center(bbox)
+    # 将像素中心转换为物理偏移（单位：米）
+    offset = SVector(center_pixel[1] * scale_factor, center_pixel[2] * scale_factor)
+    
+    # 假设 ego_state 为 (ego_position, ego_orientation)
+    ego_position = ego_state[1]  # SVector{3,Float64}，例如 (x, y, z)
+    ego_orientation = ego_state[2]  # 航向角（弧度）
+
+    # 得到目标在物理世界的 2D 位置（这里只更新 x, y 分量；z 分量与 ego 相同）
+    estimated_location = SVector(ego_position[1] + offset[1],
+                                 ego_position[2] + offset[2],
+                                 ego_position[3])
+    
+    # 根据边界框形状粗略估计目标朝向
+    bbox_width  = bbox[3] - bbox[1]
+    bbox_height = bbox[4] - bbox[2]
+    # 示例：若宽度大于高度，则假设目标与 ego 车辆朝向一致，否则旋转 90 度
+    if bbox_width >= bbox_height
+        estimated_orientation = ego_orientation
+    else
+        estimated_orientation = ego_orientation + (pi/2)
+    end
+
+    return estimated_orientation, estimated_location
+end
+    
+
+#EKF perception function
 function perception(cam_meas_channel, localization_state_channel, perception_state_channel, ekf, cnn_model; confidence_threshold=0.5)
     # set up stuff
     last_time = time()
@@ -394,6 +542,7 @@ function perception(cam_meas_channel, localization_state_channel, perception_sta
         end
 
         latest_localization_state = fetch(localization_state_channel)
+        detected_objects = Vector{DetectedObject}()
         
         # process bounding boxes / run ekf / do what you think is good
         # Simulated detection: assume bounding box center gives object (x, y)
