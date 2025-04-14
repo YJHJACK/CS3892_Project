@@ -305,7 +305,6 @@ function localization(meas_channel::Channel{MeasurementMessage},
         x_est = x_upd
         P_est = P_upd
         
-        # 发送更新后的状态和协方差
         put!(state_vec_channel, (x_est, P_est))
         sleep(0.001)
     end
@@ -349,7 +348,6 @@ function localize(
     dt_default=0.1
 )
     meas_channel = Channel{MeasurementMessage}(32)
-    # 修改 state_vec_channel 的类型为传送 (Vector, Matrix) 的 tuple
     state_vec_channel = Channel{Tuple{Vector{Float64}, Matrix{Float64}}}(32)
     @async localization(meas_channel, state_vec_channel; dt_default=dt_default)
     
