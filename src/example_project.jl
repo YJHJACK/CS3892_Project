@@ -251,9 +251,11 @@ end
 Main loop:
 - Reads measurements from meas_channel,
 - Predicts state using Δt and performs EKF updates for each GPS measurement,
-- Sends updated state vector to state_vec_channel.
+- Sends updated state vector **and updated covariance matrix** as a tuple to state_vec_channel.
 """
-function localization(meas_channel::Channel{MeasurementMessage}, state_vec_channel::Channel{Vector{Float64}}; dt_default=0.1)
+function localization(meas_channel::Channel{MeasurementMessage},
+                      state_vec_channel::Channel{Tuple{Vector{Float64}, Matrix{Float64}}};
+                      dt_default=0.1)
     # State order: [position (3); quaternion (4); velocity (3); angular velocity (3)]
     x_est = vcat([0.0, 0.0, 0.0],
                  [1.0, 0.0, 0.0, 0.0],
@@ -262,8 +264,8 @@ function localization(meas_channel::Channel{MeasurementMessage}, state_vec_chann
     # Initial covariance: different uncertainty for each part
     P_est = Diagonal([1.0, 1.0, 1.0,    # Position
                       0.1, 0.1, 0.1, 0.1, # Quaternion
-                      0.5, 0.5, 0.5,    # Velocity
-                      0.1, 0.1, 0.1])   # Angular velocity
+                      0.5, 0.5, 0.5,      # Velocity
+                      0.1, 0.1, 0.1])     # Angular velocity
     
     # Process noise covariance Q
     Q = Diagonal([0.3, 0.3, 0.3,           # Position noise
@@ -299,10 +301,12 @@ function localization(meas_channel::Channel{MeasurementMessage}, state_vec_chann
             end
         end
         
+        # Update state estimate and covariance
         x_est = x_upd
         P_est = P_upd
         
-        put!(state_vec_channel, x_est)
+        # 发送更新后的状态和协方差
+        put!(state_vec_channel, (x_est, P_est))
         sleep(0.001)
     end
 end
@@ -334,7 +338,7 @@ Wrapper function:
 - Reads measurements from gps_channel and imu_channel to create MeasurementMessage,
 - Sends the message to an internal meas_channel,
 - Calls the main localization loop,
-- Converts the output state vector to MyLocalizationType and sends it to localization_state_channel,
+- Converts the output state vector **and covariance matrix** to MyLocalizationType and sends it to localization_state_channel,
 - Monitors shutdown_channel to exit.
 """
 function localize(
@@ -345,7 +349,8 @@ function localize(
     dt_default=0.1
 )
     meas_channel = Channel{MeasurementMessage}(32)
-    state_vec_channel = Channel{Vector{Float64}}(32)
+    # 修改 state_vec_channel 的类型为传送 (Vector, Matrix) 的 tuple
+    state_vec_channel = Channel{Tuple{Vector{Float64}, Matrix{Float64}}}(32)
     @async localization(meas_channel, state_vec_channel; dt_default=dt_default)
     
     while true
@@ -369,9 +374,8 @@ function localize(
         
         # If a new state vector is available, convert and output it
         if isready(state_vec_channel)
-            x_vec = take!(state_vec_channel)
-            # Replace zeros(13,13) with the actual P if needed
-            state = convert_state(x_vec, zeros(13,13), time())
+            x_vec, P_vec = take!(state_vec_channel)
+            state = convert_state(x_vec, P_vec, time())
             put!(localization_state_channel, state)
         end
         
