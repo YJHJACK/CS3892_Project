@@ -417,7 +417,7 @@ function estimate_location_from_2_bboxes(ego_quaternion::SVector{4,Float64},
     end
 
     # 5. find min error
-    sort!(quat_loc_bboxerror_list, by = x->x[3])  # x[3] 即 total_error
+    sort!(quat_loc_bboxerror_list, by = x->x[3])  
     best_candidate = first(quat_loc_bboxerror_list)
     best_quat   = best_candidate[1]
     best_loc    = best_candidate[2]
@@ -431,6 +431,7 @@ function estimate_location_from_2_bboxes(ego_quaternion::SVector{4,Float64},
 end
 
 function predict_bboxes(quat, loc, T_body_camrot, image_width::Int, image_height::Int, pixel_len::Float64)
+    #baseline location
     x_min = 100.0 + randn()*5
     y_min = 80.0 + randn()*5
     x_max = x_min + 50.0 + randn()*5
