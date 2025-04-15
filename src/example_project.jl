@@ -127,61 +127,284 @@ function least_lane_path(all_segs::Dict{Int,RoadSegment}, start_id::Int, goal_id
     error("No path found from segment $start_id to segment $goal_id")
 end
 
-function decision_making(localization_state_channel, perception_state_channel, map, target_road_segment_id, socket)
-    # Setup a PID controller for steering.
-    pid = PIDController(2.0, 0.1, 0.5, 0.0, 0.0)
-    dt = 0.1  # time step in seconds
+function compute_segment_arc_points(seg::VehicleSim.RoadSegment, npts::Int=1)
+    lb = seg.lane_boundaries[1]
+    c  = lb.curvature
+    pA = lb.pt_a
+    pB = lb.pt_b
 
-    # For simplicity, we assume the current segment is known.
-    current_segment_id = 1
+    if isapprox(c, 0.0; atol=1e-6)
+        return [compute_segment_center_point(seg)]
+    end
 
-    # Compute the route and generate a reference trajectory.
-    route = least_lane_path(map, current_segment_id, target_road_segment_id)
-    route_segments = [map[id] for id in route]
-    trajectory = generate_trajectory_plan_with_curvature(route_segments, 200)
+    lane_width = 5.0
 
-    while true
-        # Get the latest localization state.
-        loc = fetch(localization_state_channel)
-        # If the localization estimate is not valid, wait.
+    inside_rad = 1.0 / abs(c)
+    middle_rad = inside_rad
+    chord = pB - pA
+    L = norm(chord)
+    if L/2 > middle_rad
+        @warn "Chord length is too long relative to the computed middle_rad. Returning endpoints."
+        return [pA, 0.5*(pA+pB), pB]
+    end
+
+    mid = 0.5 * (pA + pB)
+
+    h = sqrt(middle_rad^2 - (L/2)^2)
+
+    n = SVector(-chord[2], chord[1]) / L
+
+    center = c > 0 ? mid + h * n : mid - h * n
+
+    θA = atan(pA[2] - center[2], pA[1] - center[1])
+    θB = atan(pB[2] - center[2], pB[1] - center[1])
+    span = θB - θA
+    if c > 0
+        if span < 0
+            span += 2π
+        end
+    else
+        if span > 0
+            span -= 2π
+        end
+    end
+    pts = SVector{2,Float64}[]
+    for t in range(0.0, step=1.0, length=1)
+        θ = θA + t * span
+        push!(pts, center + middle_rad * SVector(cos(θ), sin(θ)))
+    end
+
+    return pts
+end
+
+function compute_segment_straight_points(seg::VehicleSim.RoadSegment)
+    lb1 = seg.lane_boundaries[1]
+    lb2 = seg.lane_boundaries[2]
+    start_center = 0.5 * (lb1.pt_a + lb2.pt_a)
+    end_center   = 0.5 * (lb1.pt_b + lb2.pt_b)
+    return [start_center[1:2], end_center[1:2]]
+end
+
+function generate_trajectory_plan(segments::Vector{VehicleSim.RoadSegment})
+    raw_pts = SVector{2,Float64}[]
+
+    for (i, seg) in enumerate(segments)
+        lb = seg.lane_boundaries[1]
+        pts = if isapprox(lb.curvature, 0.0; atol=1e-6)
+            compute_segment_straight_points(seg)
+        else
+            compute_segment_arc_points(seg, 1)
+        end
+
+        if i == 1
+            append!(raw_pts, pts)
+        else
+            append!(raw_pts, pts[2:end])
+        end        
+    end
+
+    xs = [p[1] for p in raw_pts]
+    ys = [p[2] for p in raw_pts]
+
+    plt = plot(xs, ys; st=:scatter, texts=1:length(xs))
+    display(plt)
+
+    N = length(raw_pts)
+    tk = range(0, 1, length = N)
+    xs = [p[1] for p in raw_pts]
+    ys = [p[2] for p in raw_pts]
+    sx = CubicSplineInterpolation(tk, xs)
+    sy = CubicSplineInterpolation(tk, ys)
+
+    N = length(raw_pts)
+    cum_dists = zeros(Float64, N)
+    for i in 2:N
+        cum_dists[i] = cum_dists[i-1] + norm(raw_pts[i] - raw_pts[i-1])
+    end
+    total_length = cum_dists[end]
+    
+    num_samples = 200
+    sample_dists = range(0, stop=total_length, length=num_samples)
+    sampled_points = SVector{2,Float64}[]
+    
+    current_index = 1
+    for d in sample_dists
+        while current_index < N && cum_dists[current_index+1] < d
+            current_index += 1
+        end
+        if current_index == N
+            push!(sampled_points, raw_pts[end])
+        else
+            d0 = cum_dists[current_index]
+            d1 = cum_dists[current_index+1]
+            t = (d - d0) / (d1 - d0)
+            pt = raw_pts[current_index] + t * (raw_pts[current_index+1] - raw_pts[current_index])
+            push!(sampled_points, pt)
+        end
+    end
+    return sampled_points
+end
+
+function find_current_segment(pos2d::SVector{2,Float64}, map::Dict{Int,VehicleSim.RoadSegment})
+    for (seg_id, seg) in map
+        if within_lane(pos2d, seg)
+            return seg_id
+        end
+    end
+    error("No segment found containing position $pos2d")
+end
+
+function decision_making(loc_ch, perc_ch,
+                        map::Dict{Int,VehicleSim.RoadSegment},
+                        target_seg::Int, sock)
+    @info "==== Entering decision_making ===="
+    dt = 0.01
+    MAX_STEERING_RATE = 1.25
+    MAX_SPEED = 4.0
+    MAX_ACCEL = 5.0
+
+    lookahead_base = 1.5
+    lookahead_time = 2.0
+    min_lookahead = 1.0
+    max_lookahead = 6.0
+    wheelbase = 3.0
+    k_p_speed = 1.5
+    k_i_speed = 0.15
+
+    prev_steering_angle = 0.0
+    integral = 0.0
+
+    loc0 = fetch(loc_ch)
+    p0 = SVector(loc0.position[1], loc0.position[2])
+    s0 = find_current_segment(p0, map)
+    route = least_lane_path(map, s0, target_seg)
+    segs = [map[id] for id in route]
+    traj = generate_trajectory_plan(segs)
+    traj_points = [SVector{2}(p[1], p[2]) for p in traj]
+
+    BRAKING_DISTANCE = 10.0
+    STOP_DISTANCE = 8.0
+    STOP_SPEED_THRESHOLD = 0.5
+    is_braking = false
+    while isopen(sock)
+        loc = fetch(loc_ch)
+        perc = fetch(perc_ch)
         if !loc.valid
+            serialize(sock, (0.0, 0.0, true))
             sleep(dt)
             continue
         end
+
+        current_pos = SVector(loc.position[1], loc.position[2])
+        current_heading = loc.yaw
+        current_speed = norm(SVector(loc.velocity[1], loc.velocity[2]))
+        end_point = traj_points[end]
+        distance_to_end = norm(current_pos - end_point)
+
+        obstacle_detected = false
+        safe_distance = 35.0
+
+        for obj in perc.detections
+            if obj.classification == "vehicle"
+                rel_pos = obj.position - current_pos
+                rel_dist = norm(rel_pos)
+
+                angle_to_obj = atan(rel_pos[2], rel_pos[1])
+                heading_error = atan(sin(angle_to_obj - current_heading), cos(angle_to_obj - current_heading))
+
+                if abs(heading_error) < π/4 && rel_dist ≤ safe_distance
+                    obstacle_detected = true
+                    break
+                end
+            end
+        end
+
+        if obstacle_detected
+            @info "Detected vehicle in front within $safe_distance meters. Slowing down..."
+            target_speed = 0.0
+            speed_error = target_speed - current_speed
+            acceleration = 3*clamp(speed_error * 2.0, -MAX_ACCEL, 0.0)
+            new_speed = max(current_speed + acceleration * dt *3, 0.0)
+            serialize(sock, (0.0, new_speed, true))
+            sleep(dt)
+            continue
+        end
+
+        if !is_braking && distance_to_end ≤ BRAKING_DISTANCE
+            @info "breaking"
+            is_braking = true
+        end
+
+        if is_braking
+            target_speed = if distance_to_end ≤ STOP_DISTANCE
+                0.0
+            else
+                lerp(current_speed, 0.0, (BRAKING_DISTANCE - distance_to_end)/5.0)
+            end
+
+            speed_error = target_speed - current_speed
+            acceleration = 1.5*clamp(speed_error * 2.0, -MAX_ACCEL, 0.0)
+            new_speed = current_speed + acceleration * dt
+            new_speed = max(new_speed, 0.0)
+
+            serialize(sock, (0.0, 0.0, true))
+
+            if new_speed ≤ STOP_SPEED_THRESHOLD
+                serialize(sock, (0.0, 0.0, false))
+                @info "stopped, end loop"
+                break
+            end
+
+            sleep(dt)
+            continue
+        end
+        distances = [norm(p - current_pos) for p in traj_points]
+        closest_idx = argmin(distances)
         
-        # Extract the current 2D position from the 3D position.
-        current_pos = loc.position[1:2]
-        
-        # Get the latest perception state.
-        perc = fetch(perception_state_channel)
-        
-        # Choose a lookahead point on the trajectory.
-        lookahead_idx = min(length(trajectory), 10)
-        desired_point = trajectory[lookahead_idx]
-        
-        # Compute error vector (only in 2D).
-        error_vec = desired_point - current_pos
-        distance_error = norm(error_vec)
-        desired_heading = atan(error_vec[2], error_vec[1])
-        heading_error = desired_heading - loc.yaw
-        
-        # Compute the steering command using the PID controller.
-        steering_command = update!(pid, heading_error, dt)
-        
-        # Compute a planned target velocity (for instance, proportional to the distance error).
-        planned_velocity = 1.0 * distance_error
-        
-        # Adjust the planned velocity based on collision avoidance.
-        safe_velocity = collision_avoidance_control(loc, perc, planned_velocity)
-        
-        # Form the control command (steering, velocity, flag).
-        cmd = (steering_command, safe_velocity, true)
-        serialize(socket, cmd)
-        
+        lookahead_dist = lookahead_base + current_speed * lookahead_time
+        lookahead_dist = clamp(lookahead_dist, min_lookahead, max_lookahead)
+
+        target_point = traj_points[closest_idx]
+        cumulative_dist = 0.0
+        for i in closest_idx:min(closest_idx+30, length(traj_points)-1)
+            segment_length = norm(traj_points[i+1] - traj_points[i])
+            if cumulative_dist + segment_length >= lookahead_dist
+                ratio = (lookahead_dist - cumulative_dist) / segment_length
+                target_point = traj_points[i] + ratio*(traj_points[i+1]-traj_points[i])
+                break
+            end
+            cumulative_dist += segment_length
+            target_point = traj_points[i+1]
+        end
+
+        vec_to_target = target_point - current_pos
+        target_heading = atan(vec_to_target[2], vec_to_target[1])
+        α = target_heading - current_heading
+        α = atan(sin(α), cos(α))
+
+        curvature = sin(α) / (lookahead_dist + 0.05*current_speed)
+        desired_steering = atan(curvature * wheelbase)
+
+        max_delta = MAX_STEERING_RATE * dt * 0.8
+        steering_delta = desired_steering - prev_steering_angle
+        clamped_delta = clamp(steering_delta, -max_delta, max_delta)
+        current_steering = min(prev_steering_angle + clamped_delta, MAX_STEERING_RATE)
+        prev_steering_angle = current_steering
+
+        target_speed = MAX_SPEED
+        speed_error = target_speed - current_speed
+        integral += speed_error * dt
+        integral = clamp(integral, -1.5, 1.5)
+
+        acceleration = 5*(k_p_speed * speed_error + k_i_speed * integral)
+        acceleration = clamp(acceleration, -MAX_ACCEL, MAX_ACCEL)
+        new_speed = current_speed + acceleration * dt
+        new_speed = clamp(new_speed, 0.0, MAX_SPEED)
+
+        serialize(sock, (current_steering, new_speed, true))
         sleep(dt)
     end
 end
-
 function process_gt(
         gt_channel,
         shutdown_channel,
@@ -736,9 +959,9 @@ function decision_making(localization_state_channel,
 end
 
 
-function isfull(ch::Channel)
-    length(ch.data) ≥ ch.sz_max
-end
+# function isfull(ch::Channel)
+#     length(ch.data) ≥ ch.sz_max
+# end
 
 
 function my_client(host::IPAddr=IPv4(0), port=4444)
