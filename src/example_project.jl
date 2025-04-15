@@ -2,6 +2,9 @@ using DataStructures
 using StaticArrays
 using Interpolations
 using PyCall
+using VehicleSim
+using Sokets
+using LinearAlgebra
 
 struct PIDController
     kp::Float64
