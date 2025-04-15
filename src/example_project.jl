@@ -386,10 +386,11 @@ end
 
 #given quaternion, location, bboxes from 2 cams, return estimated location region
 function estimate_location_from_2_bboxes(ego_quaternion::SVector{4,Float64},
-                                  ego_position::SVector{3,Float64},
-                                  T_body_camrot1, T_body_camrot2,
-                                  true_bboxes_cam1::Vector{NTuple{4,Float64}},
-                                  true_bboxes_cam2::Vector{NTuple{4,Float64}})
+    ego_position::SVector{3,Float64},
+    T_body_camrot1, T_body_camrot2,
+    true_bboxes_cam1::Vector{NTuple{4,Float64}},
+    true_bboxes_cam2::Vector{NTuple{4,Float64}})
+
     quat_loc_bboxerror_list = []
     base_yaw = quaternion_to_yaw(ego_quaternion)
     for dyaw in range(-0.3, 0.3, length=5)   
@@ -398,13 +399,11 @@ function estimate_location_from_2_bboxes(ego_quaternion::SVector{4,Float64},
                 # construction
                 candidate_yaw = base_yaw + dyaw
                 candidate_quat = yaw_to_quaternion(candidate_yaw)
-                candidate_loc = SVector(ego_position[1] + dx,
-                                        ego_position[2] + dy,
-                                        ego_position[3])
+                candidate_loc = SVector(ego_position[1] + dx, ego_position[2] + dy, ego_position[3])
 
                 # 2. predict bbox on canmera besed on pose
-                pred_bboxes_cam1 = predict_bboxes_from_pose(candidate_quat, candidate_loc, T_body_camrot1)
-                pred_bboxes_cam2 = predict_bboxes_from_pose(candidate_quat, candidate_loc, T_body_camrot2)
+                pred_bboxes_cam1 = predict_bboxes(candidate_quat, candidate_loc, T_body_camrot1)
+                pred_bboxes_cam2 = predict_bboxes(candidate_quat, candidate_loc, T_body_camrot2)
 
                 # 3. calculate errors
                 cam1_error = bboxes_error(pred_bboxes_cam1, true_bboxes_cam1)
@@ -425,18 +424,81 @@ function estimate_location_from_2_bboxes(ego_quaternion::SVector{4,Float64},
 
     margin = 1.0
     estimated_region = (best_loc[1] - margin, best_loc[2] - margin,
-                        best_loc[1] + margin, best_loc[2] + margin)
+    best_loc[1] + margin, best_loc[2] + margin)
 
     return best_quat, best_loc, min_error, estimated_region
 end
 
-function predict_bboxes(quat, loc, T_body_camrot, image_width::Int, image_height::Int, pixel_len::Float64)
-    #baseline location
-    x_min = 100.0 + randn()*5
-    y_min = 80.0 + randn()*5
-    x_max = x_min + 50.0 + randn()*5
-    y_max = y_min + 40.0 + randn()*5
+function predict_bboxes(quat, loc, T_body_camrot, image_width=640, image_height=480, pixel_len=0.001)
+    object_width = image_width * pixel_len   
+    object_height = image_height * pixel_len   
+    object_depth = 1.0                          
+    object_size = SVector(object_width, object_height, object_depth)
+
+    corners_world = compute_3d_corners(quat, loc, object_size)
+
+    projected_points = Vector{Tuple{Int,Int}}()
+    for Xh in corners_world
+        X_cam_hom = T_body_camrot * Xh
+        X_cam = X_cam_hom[1:3] 
+        Z = X_cam[3]
+        if Z <= 0
+            continue  
+        end
+
+        proj_x = focal_len * X_cam[1] / Z
+        proj_y = focal_len * X_cam[2] / Z
+    
+        px = convert_to_pixel(image_width, pixel_len, proj_x)
+        py = convert_to_pixel(image_height, pixel_len, proj_y)
+    
+        push!(projected_points, (px, py))
+    end
+
+    if isempty(projected_points)
+        return []
+    end
+    u_vals = [pt[1] for pt in projected_points]
+    v_vals = [pt[2] for pt in projected_points]
+    x_min = minimum(u_vals)
+    y_min = minimum(v_vals)
+    x_max = maximum(u_vals)
+    y_max = maximum(v_vals)
+
     return [(x_min, y_min, x_max, y_max)]
+end
+
+function compute_3d_corners(quat, loc, object_size)
+    w, h, d = object_size
+    dx = w/2
+    dy = h/2
+    dz = d/2
+    corners = [
+        SVector(loc[1]-dx, loc[2]-dy, loc[3]-dz),
+        SVector(loc[1]-dx, loc[2]-dy, loc[3]+dz),
+        SVector(loc[1]-dx, loc[2]+dy, loc[3]-dz),
+        SVector(loc[1]-dx, loc[2]+dy, loc[3]+dz),
+        SVector(loc[1]+dx, loc[2]-dy, loc[3]-dz),
+        SVector(loc[1]+dx, loc[2]-dy, loc[3]+dz),
+        SVector(loc[1]+dx, loc[2]+dy, loc[3]-dz),
+        SVector(loc[1]+dx, loc[2]+dy, loc[3]+dz)
+    ]
+    return [vcat(corner, 1.0) for corner in corners]
+end
+
+function convert_to_pixel(num_pixels, pixel_len, px)
+    min_val = -pixel_len*num_pixels/2
+    pix_id = cld(px - min_val, pixel_len)+1 |> Int
+    return pix_id
+end
+
+function yaw_to_quaternion(yaw::Float64)
+    half = yaw / 2
+    return SVector(cos(half), 0.0, 0.0, sin(half))
+end
+
+function quaternion_to_yaw(q::SVector{4,Float64})
+    return atan(2*(q[1]*q[4] + q[2]*q[3]), 1 - 2*(q[3]^2 + q[4]^2))
 end
 
 function bboxes_error(pred_bboxes::Vector{NTuple{4,Float64}}, true_bboxes::Vector{NTuple{4,Float64}})
