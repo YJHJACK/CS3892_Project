@@ -392,8 +392,8 @@ function estimate_location_from_2_bboxes(ego_quaternion::SVector{4,Float64},
                                   true_bboxes_cam2::Vector{NTuple{4,Float64}})
     quat_loc_bboxerror_list = []
     base_yaw = quaternion_to_yaw(ego_quaternion)
-    for dyaw in range(-0.3, 0.3, length=5)   # 在 base_yaw 附近 ±0.3 弧度
-        for dx in range(-1.0, 1.0, length=5) # 在 ego_position 附近 ±1.0 米
+    for dyaw in range(-0.3, 0.3, length=5)   
+        for dx in range(-1.0, 1.0, length=5) 
             for dy in range(-1.0, 1.0, length=5)
                 # construction
                 candidate_yaw = base_yaw + dyaw
