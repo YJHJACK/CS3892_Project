@@ -439,9 +439,6 @@ function predict_bboxes(quat, loc, T_body_camrot, image_width::Int, image_height
 end
 
 function bboxes_error(pred_bboxes::Vector{NTuple{4,Float64}}, true_bboxes::Vector{NTuple{4,Float64}})
-    if isempty(pred_bboxes) || isempty(true_bboxes)
-        return 1e6 #return HUGE error if lack of data
-    end
     p = pred_bboxes[1]
     t = true_bboxes[1]
     return abs(p[1]-t[1]) + abs(p[2]-t[2]) + abs(p[3]-t[3]) + abs(p[4]-t[4])
