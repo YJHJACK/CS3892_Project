@@ -179,7 +179,7 @@ function auto_client(host::IPAddr = IPv4(0), port::Int = 4444; ego_id::Int = 1)
     # Launch the perception module.
     # Note: perception function requires additional parameters (ekf, cnn_model);
     # here we pass placeholders (nothing) – adjust as needed.
-    @async perception(cam_channel, loc_state_channel, perc_state_channel, nothing, nothing; confidence_threshold=0.5)
+    @async perception(cam_channel, loc_state_channel, perc_state_channel, shutdown_channel)
 
     # Obtain the map and select a target road segment.
     local map_segments = VehicleSim.city_map()
