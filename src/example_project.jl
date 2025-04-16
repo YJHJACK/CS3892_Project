@@ -1,7 +1,6 @@
 using DataStructures
 using StaticArrays
 using Interpolations
-using PyCall
 using VehicleSim
 using Sockets
 using LinearAlgebra
