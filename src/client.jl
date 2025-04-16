@@ -165,20 +165,21 @@ function auto_client(host::IPAddr = IPv4(0), port::Int = 4444; ego_id::Int = 1)
                 elseif meas isa CameraMeasurement
                     put!(cam_channel, meas)
                 end
-                # (Optional: process ground truth measurements if needed for perception.)
+                # Note: Do not use ground truth measurements for localization/perception.
             end
         end
     end
 
-    # Create a shutdown channel for the localization module.
+    # Create a shutdown channel for the localization and perception modules.
     shutdown_channel = Channel{Bool}(1)
-    # Launch the EKF localization module, which reads from gps_channel and imu_channel,
-    # and outputs updated localization state into loc_state_channel.
+
+    # Launch the EKF localization module.
+    # 'localize' reads from gps_channel and imu_channel and outputs state into loc_state_channel.
     @async localize(gps_channel, imu_channel, loc_state_channel, shutdown_channel)
 
     # Launch the perception module.
-    # Note: perception function requires additional parameters (ekf, cnn_model);
-    # here we pass placeholders (nothing) – adjust as needed.
+    # 'perception' reads from cam_channel (and can use loc_state_channel) to update perc_state_channel.
+    # Adjust parameters as needed (e.g. if perception requires ekf or cnn_model, supply them accordingly).
     @async perception(cam_channel, loc_state_channel, perc_state_channel, shutdown_channel)
 
     # Obtain the map and select a target road segment.
@@ -189,7 +190,7 @@ function auto_client(host::IPAddr = IPv4(0), port::Int = 4444; ego_id::Int = 1)
     @info "Driving to target segment:" target_segment=tgt
 
     # Launch the decision making module,
-    # which will fetch the latest localization state from loc_state_channel (produced by EKF)
+    # which will fetch the latest localization state from loc_state_channel (from EKF)
     # and perception state from perc_state_channel to generate control commands.
     @async decision_making(loc_state_channel, perc_state_channel, map_segments, tgt, sock)
 end
