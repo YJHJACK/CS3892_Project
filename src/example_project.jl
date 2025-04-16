@@ -42,7 +42,7 @@ end
 
 struct MyPerceptionType
     timestamp::Float64
-    detections::Vector{Detected_Obj}
+    obstacles::Vector{Detected_Obj}
     estimated_region::NTuple{4,Float64}
 end
 
