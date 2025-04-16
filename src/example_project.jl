@@ -860,11 +860,14 @@ function estimate_object_state(ego_state, obj_bboxes::Vector{NTuple{4,Float64}};
 end
     
 
-#EKF perception function
+#particle & bbox perception function
 function perception(cam_meas_channel, localization_state_channel, perception_state_channel, shutdown_channel)
     # set up stuff
     last_time = time()
     while true
+        if isready(shutdown_channel)
+            break
+        end
         fresh_cam_meas = []
         while isready(cam_meas_channel)
             meas = take!(cam_meas_channel)
@@ -872,47 +875,47 @@ function perception(cam_meas_channel, localization_state_channel, perception_sta
         end
 
         true_bboxes_cam1 = haskey(cam_meas, :bboxes_cam1) ? cam_meas[:bboxes_cam1] : []
-    true_bboxes_cam2 = haskey(cam_meas, :bboxes_cam2) ? cam_meas[:bboxes_cam2] : []
+        true_bboxes_cam2 = haskey(cam_meas, :bboxes_cam2) ? cam_meas[:bboxes_cam2] : []
 
-    # calculate target pos
-    best_center, half_w, half_y, quat_loc_minerror_list =
+        # calculate target pos
+        best_center, half_w, half_y, quat_loc_minerror_list =
         estimate_location_from_2_bboxes(ego_orientation, ego_position,
                                         T_body_camrot1, T_body_camrot2,
                                         vehicle_size, image_width, image_height, pixel_len,
                                         true_bboxes_cam1, true_bboxes_cam2;
                                         step=candidate_step)
-    sorted_candidates = sort(quat_loc_minerror_list, by = x -> x[3])
-    selected_candidates = sorted_candidates[1:min(10, length(sorted_candidates))]
+        sorted_candidates = sort(quat_loc_minerror_list, by = x -> x[3])
+        selected_candidates = sorted_candidates[1:min(10, length(sorted_candidates))]
 
-    # initialize particles
-    particles = initializa_particles(selected_candidates, vehicle_size;
+        # initialize particles
+        particles = initializa_particles(selected_candidates, vehicle_size;
                                      varangle = pi/12, var_location = 0.5, 
                                      max_v = 7.5, step_v = 0.5, number_of_particles = 1000)
     
-    # estimate using bbox
-    if !isempty(true_bboxes_cam1)
-        obj_bboxes = [true_bboxes_cam1[1]]
-        est_obj_ori, est_obj_loc = estimate_object_state(ego_state, obj_bboxes; scale_factor=pixel_len)
-    else
-        # if no target, default to ego
-        est_obj_ori = ego_orientation
-        est_obj_loc = ego_position
-    end
+        # estimate using bbox
+        if !isempty(true_bboxes_cam1)
+            obj_bboxes = [true_bboxes_cam1[1]]
+            est_obj_ori, est_obj_loc = estimate_object_state(ego_state, obj_bboxes; scale_factor=pixel_len)
+        else
+            # if no target, default to ego
+            est_obj_ori = ego_orientation
+            est_obj_loc = ego_position
+        end
 
-    detected_object = DetectedObject(1, est_obj_ori, est_obj_loc, true_bboxes_cam1 != [] ? true_bboxes_cam1[1] : (0.0,0.0,0.0,0.0))
+        detected_object = DetectedObject(1, est_obj_ori, est_obj_loc, true_bboxes_cam1 != [] ? true_bboxes_cam1[1] : (0.0,0.0,0.0,0.0))
     
-    # update particles
-    delta_t = time() - last_time
-    updated_particles = update_particles(particles, delta_t,
+        # update particles
+        delta_t = time() - last_time
+        updated_particles = update_particles(particles, delta_t,
                                          true_bboxes_cam1, true_bboxes_cam2,
                                          ego_orientation, ego_position,
                                          T_body_camrot1, T_body_camrot2,
                                          image_width, image_height, pixel_len)
 
-    margin = 1.0  
-    estimated_region = (best_center[1]-margin, best_center[2]-margin,
+        margin = 1.0  
+        estimated_region = (best_center[1]-margin, best_center[2]-margin,
                         best_center[1]+margin, best_center[2]+margin)
-    perception_msg = MyPerceptionType(time(), [detected_object], estimated_region)
+        perception_msg = MyPerceptionType(time(), [detected_object], estimated_region)
 
         if isready(perception_state_channel)
             take!(perception_state_channel)
