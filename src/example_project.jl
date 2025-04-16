@@ -936,10 +936,6 @@ function my_client(host::IPAddr = IPv4(0), port::Int = 4444)
     cam_channel = Channel{CameraMeasurement}(32)
     gt_channel  = Channel{GroundTruthMeasurement}(32)
 
-    # Create channels for output states (localization and perception)
-    localization_state_channel = Channel{MyLocalizationType}(1)
-    perception_state_channel   = Channel{MyPerceptionType}(1)
-
     # Initialize target map segment and ego vehicle id (they will be overwritten by incoming messages)
     target_map_segment = 0
     ego_vehicle_id = 0
@@ -997,9 +993,11 @@ function my_client(host::IPAddr = IPv4(0), port::Int = 4444)
 
     # Create a shutdown channel for the localize function
     shutdown_channel = Channel{Bool}(1)
-end
 
-    @async localize(gps_channel, imu_channel, localization_state_channel)
-    @async perception(cam_channel, localization_state_channel, perception_state_channel)
-    @async decision_making(localization_state_channel, perception_state_channel, map, socket)
+    # Launch asynchronous tasks for localization, perception, and decision making.
+    @async localize(gps_channel, imu_channel, localization_state_channel, shutdown_channel)
+    # Note: perception function requires ekf and cnn_model; placeholders (nothing) are used here.
+    @async perception(cam_channel, localization_state_channel, perception_state_channel, nothing, nothing; confidence_threshold = 0.5)
+    # Launch decision making with localization state, perception state, map segments, target segment, and socket.
+    @async decision_making(localization_state_channel, perception_state_channel, map_segments, target_map_segment, socket)
 end
