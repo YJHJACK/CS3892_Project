@@ -861,7 +861,7 @@ end
     
 
 #EKF perception function
-function perception(cam_meas_channel, localization_state_channel, perception_state_channel, ekf, cnn_model; confidence_threshold=0.5)
+function perception(cam_meas_channel, localization_state_channel, perception_state_channel, shutdown_channel)
     # set up stuff
     last_time = time()
     while true
