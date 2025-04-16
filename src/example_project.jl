@@ -862,8 +862,10 @@ end
 
 #particle & bbox perception function
 function perception(cam_meas_channel, localization_state_channel, perception_state_channel, shutdown_channel)
+    @info "perception..."
     # set up stuff
     last_time = time()
+    particles = Particle[]
     while true
         if isready(shutdown_channel)
             break
@@ -895,18 +897,32 @@ function perception(cam_meas_channel, localization_state_channel, perception_sta
                                      varangle = pi/12, var_location = 0.5, 
                                      max_v = 7.5, step_v = 0.5, number_of_particles = 1000)
     
-        # estimate using bbox
+        # estimate object orientation, location
+        # if !isempty(true_bboxes_cam1) || !isempty(true_bboxes_cam2)
+        #     obj_bboxes = [true_bboxes_cam1[1]]
+        #     est_obj_ori, est_obj_loc = estimate_object_state(ego_state, obj_bboxes; scale_factor=pixel_len)
+        # else
+        #     # if no target, default to ego
+        #     est_obj_ori = ego_orientation
+        #     est_obj_loc = ego_position
+        # end
+
         if !isempty(true_bboxes_cam1)
-            obj_bboxes = [true_bboxes_cam1[1]]
-            est_obj_ori, est_obj_loc = estimate_object_state(ego_state, obj_bboxes; scale_factor=pixel_len)
+            bbox = true_bboxes_cam1[1]
+            est_obj_ori, est_obj_loc = estimate_object_state(ego_state, bbox; scale_factor=pixel_len)
+        elseif !isempty(true_bboxes_cam2)
+            bbox = true_bboxes_cam2[1]
+            est_obj_ori, est_obj_loc = estimate_object_state(ego_state, bbox; scale_factor=pixel_len)
         else
-            # if no target, default to ego
+            bbox = (0.0, 0.0, 0.0, 0.0)
             est_obj_ori = ego_orientation
             est_obj_loc = ego_position
         end
 
-        detected_object = Detected_Obj(1, true_bboxes_cam1 != [] ? true_bboxes_cam1[1] : (0.0,0.0,0.0,0.0),
-                                        1.0, "vehicle", est_obj_loc[1:2], SVector(0.0,0.0))
+        detected_object = Detected_Obj(1, bbox, 1.0, "vehicle", est_obj_loc[1:2], SVector(0.0,0.0))
+
+        # detected_object = Detected_Obj(1, true_bboxes_cam1 != [] ? true_bboxes_cam1[1] : (0.0,0.0,0.0,0.0),
+        #                                 1.0, "vehicle", est_obj_loc[1:2], SVector(0.0,0.0))
     
         # update particles
         delta_t = time() - last_time
@@ -922,7 +938,7 @@ function perception(cam_meas_channel, localization_state_channel, perception_sta
         if isready(perception_state_channel)
             take!(perception_state_channel)
         end
-        put!(perception_state_channel, perception_state)
+        put!(perception_state_channel, perception_msg)
         sleep(0.01)
     end
 end
