@@ -23,7 +23,7 @@ struct MyLocalizationType
     timestamp::Float64                  # time of the estimate
 end
 
-export MyLocalizationType
+# export MyLocalizationType
 
 struct Detected_Obj
     id::int  # id for each object
@@ -405,6 +405,7 @@ function decision_making(loc_ch, perc_ch,
         sleep(dt)
     end
 end
+
 function process_gt(
         gt_channel,
         shutdown_channel,
@@ -488,16 +489,16 @@ function localization(meas_channel::Channel{MeasurementMessage},
                  [0.0, 0.0, 0.0],
                  [0.0, 0.0, 0.0])
     # Initial covariance: different uncertainty for each part
-    P_est = Diagonal([1.0, 1.0, 1.0,    # Position
+    P_est = Diagonal([1.0, 1.0, 1.0,      # Position
                       0.1, 0.1, 0.1, 0.1, # Quaternion
                       0.5, 0.5, 0.5,      # Velocity
                       0.1, 0.1, 0.1])     # Angular velocity
     
     # Process noise covariance Q
-    Q = Diagonal([0.3, 0.3, 0.3,           # Position noise
+    Q = Diagonal([0.3, 0.3, 0.3,               # Position noise
                   0.005, 0.005, 0.005, 0.005,  # Quaternion noise
-                  0.2, 0.2, 0.2,           # Velocity noise
-                  0.02, 0.02, 0.02])        # Angular velocity noise
+                  0.2, 0.2, 0.2,               # Velocity noise
+                  0.02, 0.02, 0.02])           # Angular velocity noise
     
     # GPS measurement noise covariance R
     R_gps = Diagonal([0.5, 0.5, 0.05])
@@ -741,8 +742,8 @@ function initialize_particles(quat_loc_minerror_list; var_location=0.5,var_angle
         # 1. turn quaterion to yaw
         base_angle = quaternion_to_yaw(quat)
 
-        #    mean = [ base_angle, loc[1], loc[2] ]
-        #    cov  = diagm([var_angle^2, var_location^2, var_location^2])
+        # mean = [ base_angle, loc[1], loc[2] ]
+        # cov  = diagm([var_angle^2, var_location^2, var_location^2])
         mu = [base_angle, loc[1], loc[2]]
         cov = Matrix{Float64}(I, 3, 3)
         cov[1,1] = var_angle^2
@@ -920,98 +921,90 @@ function perception(cam_meas_channel, localization_state_channel, perception_sta
     end
 end
 
-function decision_making(localization_state_channel, 
-    perception_state_channel, 
-    map, 
-    target_road_segment_id, 
-    socket)
-    # Simple reactive control
-    while true
-        latest_localization_state = fetch(localization_state_channel)
-        latest_perception_state = fetch(perception_state_channel)
-
-        # Default commands
-        steering_angle = 0.0
-        target_vel = 0.0
-        keep_driving = false
-
-        # Only move if we are localized
-        if latest_localization_state.field1 == 1
-            # If we "see" something (basic perception cue), maybe slow down
-            if latest_perception_state.field1 == 1
-                target_vel = 1.0  # slow
-                keep_driving = false  # stop and wait (or could swerve later)
-            else
-                target_vel = 5.0  # arbitrary cruising speed
-                keep_driving = true
-            end
-        else
-            @warn "Localization not ready, vehicle staying stopped"
-        end
-
-        # Dummy logic for future: use map + target_road_segment_id for planning
-
-        cmd = (steering_angle, target_vel, keep_driving)
-        serialize(socket, cmd)
-
-        sleep(0.05)  # Send commands at 20Hz
-    end
-end
-
-
-# function isfull(ch::Channel)
-#     length(ch.data) ≥ ch.sz_max
-# end
-
-
-function my_client(host::IPAddr=IPv4(0), port=4444)
+function my_client(host::IPAddr = IPv4(0), port::Int = 4444)
+    # Connect to the server
     socket = Sockets.connect(host, port)
     map_segments = VehicleSim.city_map()
     
-    msg = deserialize(socket) # Visualization info
+    # Deserialize visualization information from the server
+    msg = deserialize(socket)  # Visualization info
     @info msg
 
+    # Create channels for incoming measurements
     gps_channel = Channel{GPSMeasurement}(32)
     imu_channel = Channel{IMUMeasurement}(32)
     cam_channel = Channel{CameraMeasurement}(32)
-    gt_channel = Channel{GroundTruthMeasurement}(32)
+    gt_channel  = Channel{GroundTruthMeasurement}(32)
 
-    #localization_state_channel = Channel{MyLocalizationType}(1)
-    #perception_state_channel = Channel{MyPerceptionType}(1)
+    # Create channels for output states (localization and perception)
+    localization_state_channel = Channel{MyLocalizationType}(1)
+    perception_state_channel   = Channel{MyPerceptionType}(1)
 
-    target_map_segment = 0 # (not a valid segment, will be overwritten by message)
-    ego_vehicle_id = 0 # (not a valid id, will be overwritten by message. This is used for discerning ground-truth messages)
+    # Initialize target map segment and ego vehicle id (they will be overwritten by incoming messages)
+    target_map_segment = 0
+    ego_vehicle_id = 0
 
-    errormonitor(@async while true
-        # This while loop reads to the end of the socket stream (makes sure you
-        # are looking at the latest messages)
-        sleep(0.001)
-        local measurement_msg
-        received = false
+    # Define a simple isfull function to check if a channel is full (using its capacity)
+    function isfull(ch::Channel)
+        return length(ch) >= ch.capacity
+    end
+
+    # Start an asynchronous task to continuously read measurement messages from the socket
+    @async begin
         while true
-            @async eof(socket)
-            if bytesavailable(socket) > 0
-                measurement_msg = deserialize(socket)
-                received = true
-            else
-                break
+            sleep(0.001)
+            local measurement_msg
+            received = false
+            while true
+                @async eof(socket)
+                if bytesavailable(socket) > 0
+                    measurement_msg = deserialize(socket)
+                    received = true
+                else
+                    break
+                end
+            end
+            if !received
+                continue
+            end
+
+            # Update target map segment and ego vehicle id from the received message
+            target_map_segment = measurement_msg.target_segment
+            ego_vehicle_id = measurement_msg.vehicle_id
+
+            # Dispatch measurements to the corresponding channels
+            for meas in measurement_msg.measurements
+                if meas isa GPSMeasurement
+                    if !isfull(gps_channel)
+                        put!(gps_channel, meas)
+                    end
+                elseif meas isa IMUMeasurement
+                    if !isfull(imu_channel)
+                        put!(imu_channel, meas)
+                    end
+                elseif meas isa CameraMeasurement
+                    if !isfull(cam_channel)
+                        put!(cam_channel, meas)
+                    end
+                elseif meas isa GroundTruthMeasurement
+                    if !isfull(gt_channel)
+                        put!(gt_channel, meas)
+                    end
+                end
             end
         end
-        !received && continue
-        target_map_segment = measurement_msg.target_segment
-        ego_vehicle_id = measurement_msg.vehicle_id
-        for meas in measurement_msg.measurements
-            if meas isa GPSMeasurement
-                !isfull(gps_channel) && put!(gps_channel, meas)
-            elseif meas isa IMUMeasurement
-                !isfull(imu_channel) && put!(imu_channel, meas)
-            elseif meas isa CameraMeasurement
-                !isfull(cam_channel) && put!(cam_channel, meas)
-            elseif meas isa GroundTruthMeasurement
-                !isfull(gt_channel) && put!(gt_channel, meas)
-            end
-        end
-    end)
+    end
+
+    # Create a shutdown channel for the localize function
+    shutdown_channel = Channel{Bool}(1)
+
+    # Launch asynchronous tasks for localization, perception, and decision making.
+    @async localize(gps_channel, imu_channel, localization_state_channel, shutdown_channel)
+    # Note: perception function requires ekf and cnn_model; placeholders (nothing) are used here.
+    @async perception(cam_channel, localization_state_channel, perception_state_channel, nothing, nothing; confidence_threshold = 0.5)
+    # Launch decision making with localization state, perception state, map segments, target segment, and socket.
+    @async decision_making(localization_state_channel, perception_state_channel, map_segments, target_map_segment, socket)
+end
 
     @async localize(gps_channel, imu_channel, localization_state_channel)
     @async perception(cam_channel, localization_state_channel, perception_state_channel)
