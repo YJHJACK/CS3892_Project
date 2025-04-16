@@ -997,13 +997,6 @@ function my_client(host::IPAddr = IPv4(0), port::Int = 4444)
 
     # Create a shutdown channel for the localize function
     shutdown_channel = Channel{Bool}(1)
-
-    # Launch asynchronous tasks for localization, perception, and decision making.
-    @async localize(gps_channel, imu_channel, localization_state_channel, shutdown_channel)
-    # Note: perception function requires ekf and cnn_model; placeholders (nothing) are used here.
-    @async perception(cam_channel, localization_state_channel, perception_state_channel, nothing, nothing; confidence_threshold = 0.5)
-    # Launch decision making with localization state, perception state, map segments, target segment, and socket.
-    @async decision_making(localization_state_channel, perception_state_channel, map_segments, target_map_segment, socket)
 end
 
     @async localize(gps_channel, imu_channel, localization_state_channel)
