@@ -3,7 +3,7 @@ using StaticArrays
 using Interpolations
 using PyCall
 using VehicleSim
-using Sokets
+using Sockets
 using LinearAlgebra
 
 struct PIDController
@@ -26,7 +26,7 @@ end
 # export MyLocalizationType
 
 struct Detected_Obj
-    id::int  # id for each object
+    id::Int  # id for each object
     bbox::NTuple{4, Float64}           # Bounding box: (x_min, y_min, x_max, y_max).
     confidence::Float64                # Confidence score from the CNN.
     classification::String
@@ -42,8 +42,9 @@ struct Particle
 end
 
 struct MyPerceptionType
-    timestamp::Int
-    Detected_Obj::Float64
+    timestamp::Float64
+    detections::Vector{Detected_Obj}
+    estimated_region::NTuple{4,Float64}
 end
 
 mutable struct ObjectEKF
@@ -874,21 +875,24 @@ function perception(cam_meas_channel, localization_state_channel, perception_sta
             push!(fresh_cam_meas, meas)
         end
 
-        true_bboxes_cam1 = haskey(cam_meas, :bboxes_cam1) ? cam_meas[:bboxes_cam1] : []
-        true_bboxes_cam2 = haskey(cam_meas, :bboxes_cam2) ? cam_meas[:bboxes_cam2] : []
+        if isempty(fresh_cam_meas)
+            sleep(0.005)
+            continue
+        end
+        current_meas = fresh_cam_meas[end]
+        true_bboxes_cam1 = haskey(current_meas, :bboxes_cam1) ? current_meas[:bboxes_cam1] : []
+        true_bboxes_cam2 = haskey(current_meas, :bboxes_cam2) ? current_meas[:bboxes_cam2] : []
 
         # calculate target pos
-        best_center, half_w, half_y, quat_loc_minerror_list =
-        estimate_location_from_2_bboxes(ego_orientation, ego_position,
+        best_quat, best_loc, min_error, estimated_region =
+            estimate_location_from_2_bboxes(ego_orientation, ego_position,
                                         T_body_camrot1, T_body_camrot2,
-                                        vehicle_size, image_width, image_height, pixel_len,
-                                        true_bboxes_cam1, true_bboxes_cam2;
-                                        step=candidate_step)
-        sorted_candidates = sort(quat_loc_minerror_list, by = x -> x[3])
+                                        true_bboxes_cam1, true_bboxes_cam2)
+        sorted_candidates = sort!(quat_loc_bboxerror_list, by = x -> x[3])
         selected_candidates = sorted_candidates[1:min(10, length(sorted_candidates))]
 
         # initialize particles
-        particles = initializa_particles(selected_candidates, vehicle_size;
+        particles = initialize_particles(selected_candidates, vehicle_size;
                                      varangle = pi/12, var_location = 0.5, 
                                      max_v = 7.5, step_v = 0.5, number_of_particles = 1000)
     
@@ -902,25 +906,25 @@ function perception(cam_meas_channel, localization_state_channel, perception_sta
             est_obj_loc = ego_position
         end
 
-        detected_object = DetectedObject(1, est_obj_ori, est_obj_loc, true_bboxes_cam1 != [] ? true_bboxes_cam1[1] : (0.0,0.0,0.0,0.0))
+        detected_object = Detected_Obj(1, true_bboxes_cam1 != [] ? true_bboxes_cam1[1] : (0.0,0.0,0.0,0.0),
+                                        1.0, "vehicle", est_obj_loc[1:2], SVector(0.0,0.0))
     
         # update particles
         delta_t = time() - last_time
+        last_time = time()
         updated_particles = update_particles(particles, delta_t,
                                          true_bboxes_cam1, true_bboxes_cam2,
                                          ego_orientation, ego_position,
                                          T_body_camrot1, T_body_camrot2,
                                          image_width, image_height, pixel_len)
 
-        margin = 1.0  
-        estimated_region = (best_center[1]-margin, best_center[2]-margin,
-                        best_center[1]+margin, best_center[2]+margin)
         perception_msg = MyPerceptionType(time(), [detected_object], estimated_region)
 
         if isready(perception_state_channel)
             take!(perception_state_channel)
         end
         put!(perception_state_channel, perception_state)
+        sleep(0.01)
     end
 end
 
