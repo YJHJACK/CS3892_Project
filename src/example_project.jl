@@ -2,16 +2,30 @@ using DataStructures
 using StaticArrays
 using Interpolations
 using VehicleSim
-using Sockets
 using LinearAlgebra
+using Plots
+using VehicleSim: f, Jac_x_f, h_gps, Jac_h_gps, extract_yaw_from_quaternion
 
-struct PIDController
-    kp::Float64
-    ki::Float64
-    kd::Float64
+mutable struct PIDController
+    Kp::Float64
+    Ki::Float64
+    Kd::Float64
     integral::Float64
-    last_error::Float64
+    prev_error::Float64
+
+    function PIDController(Kp, Ki, Kd)
+        new(Kp, Ki, Kd, 0.0, 0.0)
+    end
 end
+
+function pid_update(pid::PIDController, error, dt)
+    pid.integral += error * dt
+    derivative = (error - pid.prev_error) / dt
+    pid.prev_error = error
+    return pid.Kp * error + pid.Ki * pid.integral + pid.Kd * derivative
+end
+
+export MyLocalizationType, Detected_Obj, MyPerceptionType
 
 struct MyLocalizationType
     valid::Bool                         # indicates if the estimate is valid
@@ -22,15 +36,15 @@ struct MyLocalizationType
     timestamp::Float64                  # time of the estimate
 end
 
-# export MyLocalizationType
-
 struct Detected_Obj
     id::Int  # id for each object
     bbox::NTuple{4, Float64}           # Bounding box: (x_min, y_min, x_max, y_max).
     confidence::Float64                # Confidence score from the CNN.
-    classification::String
+    classification::String             # e.g., "vehicle", "pedestrian"
     position::SVector{2, Float64}      # Estimated 2D position (from EKF fusion).
     velocity::SVector{2, Float64}      # Estimated 2D velocity (if available).
+    uncertainty::Matrix{Float64}       # Covariance of the position estimate.
+    sensor_source::String              # e.g., "camera", "lidar"
 end
 
 struct Particle
@@ -42,71 +56,63 @@ end
 
 struct MyPerceptionType
     timestamp::Float64
-    obstacles::Vector{Detected_Obj}
-    estimated_region::NTuple{4,Float64}
+    detections::Vector{Detected_Obj}
+    estimated_region::NTuple{4, Float64}
 end
 
-mutable struct ObjectEKF
-    x::Vector{Float64}      # State: [x, y, vx, vy]
-    P::Matrix{Float64}      # Covariance
-    Q::Matrix{Float64}      # Process noise
-    R::Matrix{Float64}      # Measurement noise
+function within_lane(pos::SVector{2,Float64}, seg::VehicleSim.RoadSegment)
+    nb = length(seg.lane_boundaries)
+    
+    if nb ≥ 3
+        # Use the second and third lane boundaries.
+        A = seg.lane_boundaries[2].pt_a
+        B = seg.lane_boundaries[2].pt_b
+        C = seg.lane_boundaries[3].pt_a
+        D = seg.lane_boundaries[3].pt_b
+    elseif nb == 2
+        # Fall back on the first and second boundaries.
+        A = seg.lane_boundaries[1].pt_a
+        B = seg.lane_boundaries[1].pt_b
+        C = seg.lane_boundaries[2].pt_a
+        D = seg.lane_boundaries[2].pt_b
+    else
+        @warn "Segment has less than 2 lane boundaries!"
+        return false
+    end
+
+    min_x = min(A[1], B[1], C[1], D[1])
+    max_x = max(A[1], B[1], C[1], D[1])
+    min_y = min(A[2], B[2], C[2], D[2])
+    max_y = max(A[2], B[2], C[2], D[2])
+    
+    return (min_x <= pos[1] <= max_x) && (min_y <= pos[2] <= max_y)
 end
 
-# Update function: updates PID
-function PID_update!(pid::PIDController, error, dt)
-    pid.integral += error * dt
-    derivative = (error - pid.last_error) / dt
-    pid.last_error = error
-    return pid.kp * error + pid.ki * pid.integral + pid.kd * derivative
-end
-
-# Helper function: prevents collision
-function collision_avoidance_control(ego_state, perception_state, planned_velocity)
-    # Define a safety distance (in meters)
+function collision_avoidance_control(ego::MyLocalizationType,
+    perc::MyPerceptionType,
+    planned_vel::Float64)
     safety_distance = 8.0
-    
-    # Initialize the adjusted velocity with the planned value
-    adjusted_velocity = planned_velocity
-    
-    # Assume perception_state.obstacles is a vector of obstacles, each with a 'pos' field.
-    # Here, we check only obstacles that are ahead (in the vehicle's forward direction).
-    for obs in perception_state.obstacles
-        # Compute the vector from ego to obstacle
-        relative_vec = obs.pos - ego_state.pos
-        
-        # Project the relative vector on the vehicle's heading (using ego_state.yaw)
-        # Compute the unit vector in the direction of ego heading:
-        forward = SVector(cos(ego_state.yaw), sin(ego_state.yaw))
-        # Calculate how far ahead the obstacle is:
-        distance_ahead = dot(relative_vec, forward)
-        
-        # If the obstacle is ahead and closer than the safety distance:
-        if distance_ahead > 0 && distance_ahead < safety_distance
-            # Reduce the target velocity (for instance, to zero or a low speed)
-            adjusted_velocity = min(adjusted_velocity, 0.0)
+    factor = 1.0
+    forward = SVector(cos(ego.yaw), sin(ego.yaw))
+    for obj in perc.detected_objs
+        rel = obj.position - ego.position[1:2]
+        dist_ahead = dot(rel, forward)
+        if dist_ahead>0 && dist_ahead<safety_distance
+            factor = min(factor, dist_ahead/safety_distance)
         end
     end
-    
-    return adjusted_velocity
+    return planned_vel*factor
 end
 
-# Lane generator: generates a list of lanes (least number) that the ego will pass in order from the beginning to the destination
-function least_lane_path(all_segs::Dict{Int,RoadSegment}, start_id::Int, goal_id::Int)
-    # Use a queue for a breadth-first search.
+function least_lane_path(all_segs::Dict{Int,VehicleSim.RoadSegment}, start_id::Int, goal_id::Int)
     queue = Queue{Int}()
     enqueue!(queue, start_id)
-    
-    # Dictionary to record the predecessor for each segment.
     came_from = Dict{Int,Int}()
-    
-    # Set to track visited segments.
     visited = Set{Int}([start_id])
     
     while !isempty(queue)
         current = dequeue!(queue)
         if current == goal_id
-            # Reconstruct the path by walking backwards.
             path = [current]
             while haskey(came_from, current)
                 current = came_from[current]
@@ -115,7 +121,6 @@ function least_lane_path(all_segs::Dict{Int,RoadSegment}, start_id::Int, goal_id
             return reverse(path)
         end
         
-        # For each neighbor reachable from this segment.
         for neighbor in all_segs[current].children
             if neighbor ∉ visited
                 push!(visited, neighbor)
@@ -185,6 +190,9 @@ function compute_segment_straight_points(seg::VehicleSim.RoadSegment)
     return [start_center[1:2], end_center[1:2]]
 end
 
+# Generate a smooth trajectory from a list of segments.
+# For each segment, if the curvature is negligible the segment is treated as straight;
+# otherwise it is treated as curved.
 function generate_trajectory_plan(segments::Vector{VehicleSim.RoadSegment})
     raw_pts = SVector{2,Float64}[]
 
@@ -213,8 +221,6 @@ function generate_trajectory_plan(segments::Vector{VehicleSim.RoadSegment})
     tk = range(0, 1, length = N)
     xs = [p[1] for p in raw_pts]
     ys = [p[2] for p in raw_pts]
-    sx = CubicSplineInterpolation(tk, xs)
-    sy = CubicSplineInterpolation(tk, ys)
 
     N = length(raw_pts)
     cum_dists = zeros(Float64, N)
@@ -245,365 +251,98 @@ function generate_trajectory_plan(segments::Vector{VehicleSim.RoadSegment})
     return sampled_points
 end
 
-function find_current_segment(pos2d::SVector{2,Float64}, map::Dict{Int,VehicleSim.RoadSegment})
-    for (seg_id, seg) in map
-        if within_lane(pos2d, seg)
-            return seg_id
-        end
-    end
-    error("No segment found containing position $pos2d")
-end
-
-function decision_making(loc_ch, perc_ch,
-                        map::Dict{Int,VehicleSim.RoadSegment},
-                        target_seg::Int, sock)
-    @info "==== Entering decision_making ===="
-    dt = 0.01
-    MAX_STEERING_RATE = 1.25
-    MAX_SPEED = 4.0
-    MAX_ACCEL = 5.0
-
-    lookahead_base = 1.5
-    lookahead_time = 2.0
-    min_lookahead = 1.0
-    max_lookahead = 6.0
-    wheelbase = 3.0
-    k_p_speed = 1.5
-    k_i_speed = 0.15
-
-    prev_steering_angle = 0.0
-    integral = 0.0
-
-    loc0 = fetch(loc_ch)
-    p0 = SVector(loc0.position[1], loc0.position[2])
-    s0 = find_current_segment(p0, map)
-    route = least_lane_path(map, s0, target_seg)
-    segs = [map[id] for id in route]
-    traj = generate_trajectory_plan(segs)
-    traj_points = [SVector{2}(p[1], p[2]) for p in traj]
-
-    BRAKING_DISTANCE = 10.0
-    STOP_DISTANCE = 8.0
-    STOP_SPEED_THRESHOLD = 0.5
-    is_braking = false
-    while isopen(sock)
-        loc = fetch(loc_ch)
-        perc = fetch(perc_ch)
-        if !loc.valid
-            serialize(sock, (0.0, 0.0, true))
-            sleep(dt)
-            continue
-        end
-
-        current_pos = SVector(loc.position[1], loc.position[2])
-        current_heading = loc.yaw
-        current_speed = norm(SVector(loc.velocity[1], loc.velocity[2]))
-        end_point = traj_points[end]
-        distance_to_end = norm(current_pos - end_point)
-
-        obstacle_detected = false
-        safe_distance = 35.0
-
-        for obj in perc.detections
-            if obj.classification == "vehicle"
-                rel_pos = obj.position - current_pos
-                rel_dist = norm(rel_pos)
-
-                angle_to_obj = atan(rel_pos[2], rel_pos[1])
-                heading_error = atan(sin(angle_to_obj - current_heading), cos(angle_to_obj - current_heading))
-
-                if abs(heading_error) < π/4 && rel_dist ≤ safe_distance
-                    obstacle_detected = true
-                    break
-                end
-            end
-        end
-
-        if obstacle_detected
-            @info "Detected vehicle in front within $safe_distance meters. Slowing down..."
-            target_speed = 0.0
-            speed_error = target_speed - current_speed
-            acceleration = 3*clamp(speed_error * 2.0, -MAX_ACCEL, 0.0)
-            new_speed = max(current_speed + acceleration * dt *3, 0.0)
-            serialize(sock, (0.0, new_speed, true))
-            sleep(dt)
-            continue
-        end
-
-        if !is_braking && distance_to_end ≤ BRAKING_DISTANCE
-            @info "breaking"
-            is_braking = true
-        end
-
-        if is_braking
-            target_speed = if distance_to_end ≤ STOP_DISTANCE
-                0.0
-            else
-                lerp(current_speed, 0.0, (BRAKING_DISTANCE - distance_to_end)/5.0)
-            end
-
-            speed_error = target_speed - current_speed
-            acceleration = 1.5*clamp(speed_error * 2.0, -MAX_ACCEL, 0.0)
-            new_speed = current_speed + acceleration * dt
-            new_speed = max(new_speed, 0.0)
-
-            serialize(sock, (0.0, 0.0, true))
-
-            if new_speed ≤ STOP_SPEED_THRESHOLD
-                serialize(sock, (0.0, 0.0, false))
-                @info "stopped, end loop"
-                break
-            end
-
-            sleep(dt)
-            continue
-        end
-        distances = [norm(p - current_pos) for p in traj_points]
-        closest_idx = argmin(distances)
-        
-        lookahead_dist = lookahead_base + current_speed * lookahead_time
-        lookahead_dist = clamp(lookahead_dist, min_lookahead, max_lookahead)
-
-        target_point = traj_points[closest_idx]
-        cumulative_dist = 0.0
-        for i in closest_idx:min(closest_idx+30, length(traj_points)-1)
-            segment_length = norm(traj_points[i+1] - traj_points[i])
-            if cumulative_dist + segment_length >= lookahead_dist
-                ratio = (lookahead_dist - cumulative_dist) / segment_length
-                target_point = traj_points[i] + ratio*(traj_points[i+1]-traj_points[i])
-                break
-            end
-            cumulative_dist += segment_length
-            target_point = traj_points[i+1]
-        end
-
-        vec_to_target = target_point - current_pos
-        target_heading = atan(vec_to_target[2], vec_to_target[1])
-        α = target_heading - current_heading
-        α = atan(sin(α), cos(α))
-
-        curvature = sin(α) / (lookahead_dist + 0.05*current_speed)
-        desired_steering = atan(curvature * wheelbase)
-
-        max_delta = MAX_STEERING_RATE * dt * 0.8
-        steering_delta = desired_steering - prev_steering_angle
-        clamped_delta = clamp(steering_delta, -max_delta, max_delta)
-        current_steering = min(prev_steering_angle + clamped_delta, MAX_STEERING_RATE)
-        prev_steering_angle = current_steering
-
-        target_speed = MAX_SPEED
-        speed_error = target_speed - current_speed
-        integral += speed_error * dt
-        integral = clamp(integral, -1.5, 1.5)
-
-        acceleration = 5*(k_p_speed * speed_error + k_i_speed * integral)
-        acceleration = clamp(acceleration, -MAX_ACCEL, MAX_ACCEL)
-        new_speed = current_speed + acceleration * dt
-        new_speed = clamp(new_speed, 0.0, MAX_SPEED)
-
-        serialize(sock, (current_steering, new_speed, true))
-        sleep(dt)
-    end
-end
-
-function process_gt(
-        gt_channel,
-        shutdown_channel,
-        localization_state_channel,
-        perception_state_channel)
-
+# Ground Truth 处理
+function process_gt(gt_ch, sd_ch, loc_ch, perc_ch)
     while true
-        fetch(shutdown_channel) && break
-
-        fresh_gt_meas = []
-        while isready(gt_channel)
-            meas = take!(gt_channel)
-            push!(fresh_gt_meas, meas)
-        end
-
-        # process the fresh gt_measurements to produce localization_state and
-        # perception_state
-        
-        take!(localization_state_channel)
-        put!(localization_state_channel, new_localization_state_from_gt)
-        
-        take!(perception_state_channel)
-        put!(perception_state_channel, new_perception_state_from_gt)
+        fetch(sd_ch) && break
+        b=[]; while isready(gt_ch); push!(b,take!(gt_ch)); end
+        take!(loc_ch); put!(loc_ch, new_localization_state_from_gt)
+        take!(perc_ch); put!(perc_ch, new_perception_state_from_gt)
     end
 end
 
-# -------------------------
-# Helper Functions
-# -------------------------
-function normalize_angle(angle::Float64)
-    while angle > π
-        angle -= 2π
-    end
-    while angle < -π
-        angle += 2π
-    end
-    angle
+# 归一化角度到 [-π, π]
+function normalize_angle(a::Float64)
+    while a>π; a-=2π end
+    while a<-π; a+=2π end
+    return a
 end
 
-# EKF Prediction: predict state and covariance after Δt
-function ekf_predict(x::Vector{Float64}, P::Matrix{Float64}, Δt::Float64, Q::Matrix{Float64})
-    x_pred = f(x, Δt)               # Process model function
-    F = Jac_x_f(x, Δt)              # Jacobian of process model
-    P_pred = F * P * F' + Q         # Covariance prediction
+# EKF 预测：接受任意 AbstractMatrix
+function ekf_predict(x::Vector{Float64}, P::AbstractMatrix{Float64}, Δt::Float64, Q::AbstractMatrix{Float64})
+    x_pred = f(x, Δt)
+    F      = Jac_x_f(x, Δt)
+    P_pred = F*P*F' + Q
     return x_pred, P_pred
 end
 
-# EKF Update: update state using measurement z
-function ekf_update(x::Vector{Float64}, P::Matrix{Float64}, z::Vector{Float64},
-                    h::Function, H::Function, R::Matrix{Float64})
-    z_pred = h(x)                   # Predicted measurement
-    y = z - z_pred                  # Measurement residual
-    if length(y) >= 3
-        y[3] = normalize_angle(y[3])
-    end
-    Hx = H(x)                       # Jacobian of measurement model
-    S = Hx * P * Hx' + R            # Residual covariance
-    K = P * Hx' * inv(S)            # Kalman gain
-    x_new = x + K * y               # State update
-    P_new = (I - K * Hx) * P        # Covariance update
+# EKF 更新：接受任意 AbstractMatrix
+function ekf_update(x::Vector{Float64}, P::AbstractMatrix{Float64}, z::Vector{Float64}, h::Function, H::Function, R::AbstractMatrix{Float64})
+    z_pred = h(x)
+    y = z .- z_pred
+    if length(y)≥3; y[3]=normalize_angle(y[3]); end
+    Hx = H(x)
+    S = Hx*P*Hx' + R
+    K = P*Hx'*inv(S)
+    x_new = x + K*y
+    P_new = (I - K*Hx)*P
     return x_new, P_new
 end
 
-# -------------------------
-# Main Localization Loop (EKF)
-# -------------------------
-"""
-    localization(meas_channel, state_vec_channel; dt_default=0.1)
-
-Main loop:
-- Reads measurements from meas_channel,
-- Predicts state using Δt and performs EKF updates for each GPS measurement,
-- Sends updated state vector **and updated covariance matrix** as a tuple to state_vec_channel.
-"""
-function localization(meas_channel::Channel{MeasurementMessage},
-                      state_vec_channel::Channel{Tuple{Vector{Float64}, Matrix{Float64}}};
-                      dt_default=0.1)
-    # State order: [position (3); quaternion (4); velocity (3); angular velocity (3)]
-    x_est = vcat([0.0, 0.0, 0.0],
-                 [1.0, 0.0, 0.0, 0.0],
-                 [0.0, 0.0, 0.0],
-                 [0.0, 0.0, 0.0])
-    # Initial covariance: different uncertainty for each part
-    P_est = Diagonal([1.0, 1.0, 1.0,      # Position
-                      0.1, 0.1, 0.1, 0.1, # Quaternion
-                      0.5, 0.5, 0.5,      # Velocity
-                      0.1, 0.1, 0.1])     # Angular velocity
-    
-    # Process noise covariance Q
-    Q = Diagonal([0.3, 0.3, 0.3,               # Position noise
-                  0.005, 0.005, 0.005, 0.005,  # Quaternion noise
-                  0.2, 0.2, 0.2,               # Velocity noise
-                  0.02, 0.02, 0.02])           # Angular velocity noise
-    
-    # GPS measurement noise covariance R
-    R_gps = Diagonal([0.5, 0.5, 0.05])
-    
+# 主循环：本地化
+function localization(meas_ch::Channel{MeasurementMessage}, state_ch::Channel{Tuple{Vector{Float64},Matrix{Float64}}}; dt_default=0.1)
+    x_est = vcat([0.0,0.0,0.0], [1.0,0.0,0.0,0.0], [0.0,0.0,0.0], [0.0,0.0,0.0])
+    P_est = Diagonal([1.0,1.0,1.0, 0.1,0.1,0.1,0.1, 0.5,0.5,0.5, 0.1,0.1,0.1])
+    Q     = Diagonal([0.3,0.3,0.3, 0.005,0.005,0.005,0.005, 0.2,0.2,0.2, 0.02,0.02,0.02])
+    Rgps  = Diagonal([0.5,0.5,0.05])
     last_time = time()
-    
     while true
-        # Get message from measurement channel
-        meas_msg = take!(meas_channel)
-        meas_time = isempty(meas_msg.measurements) ? time() : meas_msg.measurements[1].time
-        Δt = meas_time - last_time
-        if Δt <= 0
-            Δt = dt_default
-        end
-        last_time = meas_time
-        
-        # Prediction step
+        msg = take!(meas_ch)
+        t = isempty(msg.measurements) ? time() : msg.measurements[1].time
+        Δt = max(t - last_time, dt_default)
+        last_time = t
         x_pred, P_pred = ekf_predict(x_est, P_est, Δt, Q)
-        
-        x_upd = x_pred
-        P_upd = P_pred
-        # Update for each GPS measurement
-        for m in meas_msg.measurements
+        x_upd, P_upd = x_pred, P_pred
+        for m in msg.measurements
             if m isa GPSMeasurement
                 z = [m.lat, m.long, m.heading]
-                x_upd, P_upd = ekf_update(x_upd, P_upd, z, h_gps, Jac_h_gps, R_gps)
+                x_upd, P_upd = ekf_update(x_upd, P_upd, z, h_gps, Jac_h_gps, Rgps)
             end
         end
-        
-        # Update state estimate and covariance
-        x_est = x_upd
-        P_est = P_upd
-        
-        put!(state_vec_channel, (x_est, P_est))
+        x_est, P_est = x_upd, P_upd
+        put!(state_ch, (x_est, Matrix(P_est)))
         sleep(0.001)
     end
 end
 
-# -------------------------
-# Helper: State Conversion
-# -------------------------
-"""
-    convert_state(x, P, t) -> MyLocalizationType
-
-Converts the state vector x (length 13) to MyLocalizationType,
-extracts position, yaw, velocity and adds timestamp t.
-Assumes extract_yaw_from_quaternion is defined.
-"""
+# 状态向量转换
 function convert_state(x::Vector{Float64}, P::Matrix{Float64}, t::Float64)::MyLocalizationType
-    pos = SVector{3,Float64}(x[1:3])
-    yaw = extract_yaw_from_quaternion(x[4:7])
-    vel = SVector{3,Float64}(x[8:10])
-    return MyLocalizationType(true, pos, yaw, vel, P, t)
+    return MyLocalizationType(true,
+        SVector(x[1:3]...),
+        extract_yaw_from_quaternion(x[4:7]),
+        SVector(x[8:10]...),
+        P,
+        t)
 end
 
-# -------------------------
-# Wrapper: localize
-# -------------------------
-"""
-    localize(gps_channel, imu_channel, localization_state_channel, shutdown_channel; dt_default=0.1)
-
-Wrapper function:
-- Reads measurements from gps_channel and imu_channel to create MeasurementMessage,
-- Sends the message to an internal meas_channel,
-- Calls the main localization loop,
-- Converts the output state vector **and covariance matrix** to MyLocalizationType and sends it to localization_state_channel,
-- Monitors shutdown_channel to exit.
-"""
-function localize(
-    gps_channel::Channel{GPSMeasurement},
-    imu_channel::Channel{IMUMeasurement},
-    localization_state_channel::Channel{MyLocalizationType},
-    shutdown_channel::Channel{Bool};
-    dt_default=0.1
-)
-    meas_channel = Channel{MeasurementMessage}(32)
-    state_vec_channel = Channel{Tuple{Vector{Float64}, Matrix{Float64}}}(32)
-    @async localization(meas_channel, state_vec_channel; dt_default=dt_default)
-    
+# 包装函数：localize
+function localize(gps_ch::Channel{GPSMeasurement}, imu_ch::Channel{IMUMeasurement}, loc_ch::Channel{MyLocalizationType}, sd_ch::Channel{Bool}; dt_default=0.1)
+    meas_ch  = Channel{MeasurementMessage}(32)
+    state_ch = Channel{Tuple{Vector{Float64},Matrix{Float64}}}(32)
+    errormonitor(@async localization(meas_ch, state_ch; dt_default=dt_default))
     while true
-        if isready(shutdown_channel) && take!(shutdown_channel)
-            close(meas_channel)
-            close(state_vec_channel)
-            break
+        if isready(sd_ch) && take!(sd_ch)
+            close(meas_ch); close(state_ch); break
         end
-        
-        # Collect GPS measurements (extend for IMU if needed)
-        measurements = GPSMeasurement[]
-        while isready(gps_channel)
-            push!(measurements, take!(gps_channel))
+        gps_msgs = GPSMeasurement[]
+        while isready(gps_ch); push!(gps_msgs, take!(gps_ch)); end
+        if !isempty(gps_msgs)
+            put!(meas_ch, MeasurementMessage(1,0,gps_msgs))
         end
-        
-        if !isempty(measurements)
-            # Create MeasurementMessage (using vehicle_id=1, target_segment=0 as an example)
-            meas_msg = MeasurementMessage(1, 0, measurements)
-            put!(meas_channel, meas_msg)
+        if isready(state_ch)
+            xv, Pv = take!(state_ch)
+            put!(loc_ch, convert_state(xv, Pv, time()))
         end
-        
-        # If a new state vector is available, convert and output it
-        if isready(state_vec_channel)
-            x_vec, P_vec = take!(state_vec_channel)
-            state = convert_state(x_vec, P_vec, time())
-            put!(localization_state_channel, state)
-        end
-        
         sleep(0.005)
     end
 end
@@ -943,83 +682,216 @@ function perception(cam_meas_channel, localization_state_channel, perception_sta
     end
 end
 
-function my_client(host::IPAddr = IPv4(0), port::Int = 4444)
-    # Connect to the server
-    socket = Sockets.connect(host, port)
-    map_segments = VehicleSim.city_map()
-    
-    # Deserialize visualization information from the server
-    msg = deserialize(socket)  # Visualization info
-    @info msg
-
-    # Create channels for incoming measurements
-    gps_channel = Channel{GPSMeasurement}(32)
-    imu_channel = Channel{IMUMeasurement}(32)
-    cam_channel = Channel{CameraMeasurement}(32)
-    gt_channel  = Channel{GroundTruthMeasurement}(32)
-
-    # Initialize target map segment and ego vehicle id (they will be overwritten by incoming messages)
-    target_map_segment = 0
-    ego_vehicle_id = 0
-
-    # Define a simple isfull function to check if a channel is full (using its capacity)
-    function isfull(ch::Channel)
-        return length(ch) >= ch.capacity
+function find_current_segment(pos2d::SVector{2,Float64}, map::Dict{Int,VehicleSim.RoadSegment})
+    for (seg_id, seg) in map
+        if within_lane(pos2d, seg)
+            return seg_id
+        end
     end
+    error("No segment found containing position $pos2d")
+end
 
-    # Start an asynchronous task to continuously read measurement messages from the socket
-    @async begin
-        while true
-            sleep(0.001)
-            local measurement_msg
-            received = false
-            while true
-                @async eof(socket)
-                if bytesavailable(socket) > 0
-                    measurement_msg = deserialize(socket)
-                    received = true
-                else
+function find_target_point(traj_points, current_pos, lookahead_dist)
+    isempty(traj_points) && error("Trajectory points are empty")
+    
+    distances = [norm(p - current_pos) for p in traj_points]
+    closest_idx = argmin(distances)
+    
+    cumulative_dist = 0.0
+    target_point = traj_points[closest_idx]
+    
+    for i in closest_idx:min(closest_idx+100, length(traj_points)-1)
+        segment = traj_points[i+1] - traj_points[i]
+        segment_length = norm(segment)
+        
+        if cumulative_dist + segment_length >= lookahead_dist
+            ratio = (lookahead_dist - cumulative_dist) / segment_length
+            return traj_points[i] + ratio * segment
+        end
+        
+        cumulative_dist += segment_length
+        target_point = traj_points[i+1]
+    end
+    return target_point
+end
+
+function decision_making(loc_ch, perc_ch, map::Dict{Int,VehicleSim.RoadSegment}, target_seg::Int, sock)
+
+    dt = 0.01
+    MAX_STEERING_RATE = 0.4
+    MAX_SPEED = 4.0
+    MAX_ACCEL = 5.0
+    wheelbase = 2.0
+    
+    lookahead_base = 3.5
+    lookahead_time = 1.5
+    min_lookahead = 1.0
+    max_lookahead = 6.0
+    
+    k_p_speed = 1.5
+    k_i_speed = 0.15
+    speed_pid = PIDController(k_p_speed, k_i_speed, 0.0)
+    
+    prev_steering_angle = 0.0
+    is_braking = false
+    is_steering_adjustment = false
+    STEERING_ERROR_THRESHOLD = 0.05
+    STEERING_RECOVER_THRESHOLD = 0.03
+    
+    @info "Localization Fetch1 Starts"
+    loc0 = fetch(loc_ch)
+    @info "Localization Fetch1 Ends"
+
+    p0 = SVector(loc0.position[1], loc0.position[2])
+    s0 = find_current_segment(p0, map)
+    route = least_lane_path(map, s0, target_seg)
+    segs = [map[id] for id in route]
+    traj = generate_trajectory_plan(segs)
+    traj_points = [SVector{2}(p[1], p[2]) for p in traj]
+
+    # put!(perc_ch, MyPerceptionType(time(), Detected_Obj[], ))
+
+    while isopen(sock)
+        @info "Localization Fetch2 Starts"
+        loc = fetch(loc_ch)
+        @info "Localization Fetch2 Ends"
+        perc = fetch(perc_ch)
+        
+        if !loc.valid
+            serialize(sock, (0.0, 0.0, true))
+            sleep(dt)
+            continue
+        end
+
+        current_pos = SVector(loc.position[1], loc.position[2])
+        current_heading = loc.yaw
+        current_speed = norm(SVector(loc.velocity[1], loc.velocity[2]))
+        
+        obstacle_detected = false
+        safe_distance = 35.0
+        for obj in perc.detections
+            if obj.classification == "vehicle"
+                rel_pos = obj.position - current_pos
+                if norm(rel_pos) ≤ safe_distance && abs(atan(rel_pos[2], rel_pos[1])) < π/4
+                    obstacle_detected = true
                     break
                 end
             end
-            if !received
-                continue
+        end
+        
+        if obstacle_detected
+            target_speed = 0.0
+            speed_error = target_speed - current_speed
+            acceleration = clamp(speed_error * 2.0, -MAX_ACCEL, 0.0)
+            new_speed = max(current_speed + acceleration * dt *3, 0.0)
+            serialize(sock, (0.0, new_speed, true))
+            sleep(dt)
+            continue
+        end
+
+        end_point = traj_points[end]
+        distance_to_end = norm(current_pos - end_point)
+        if !is_braking && distance_to_end ≤ 10.0
+            is_braking = true
+        end
+        
+        lookahead_dist = 6.0
+        target_point = find_target_point(traj_points, current_pos, lookahead_dist)
+        
+        vec = target_point - current_pos
+        x_vehicle = cos(current_heading) * vec[1] + sin(current_heading) * vec[2]
+        y_vehicle = -sin(current_heading) * vec[1] + cos(current_heading) * vec[2]
+        target_alpha = atan(y_vehicle, x_vehicle)
+        
+        alpha = target_alpha
+        alpha = alpha - 2π * floor((alpha + π) / (2π))
+        
+        if !is_steering_adjustment && abs(alpha) > STEERING_ERROR_THRESHOLD
+            @info "$(round(alpha, digits=3))"
+            is_steering_adjustment = true
+            speed_pid.integral = 0.0
+        end
+        
+        if is_steering_adjustment
+            target_speed = 0.0
+            speed_error = target_speed - current_speed
+            acceleration = clamp(speed_error * 5.0, -MAX_ACCEL, 0.0)
+            new_speed = max(current_speed + acceleration * dt, 0.0)
+            desired_steering = atan(2 * wheelbase * sin(alpha) / lookahead_dist)
+            
+            if abs(alpha) ≤ STEERING_RECOVER_THRESHOLD
+                @info "转向调整完成"
+                is_steering_adjustment = false
             end
+        else
+            target_speed = is_braking ? lerp(current_speed, 0.0, (10.0 - distance_to_end)/5.0) : MAX_SPEED
+            speed_error = target_speed - current_speed
+            acceleration = pid_update(speed_pid, speed_error, dt)
+            acceleration = clamp(acceleration, -MAX_ACCEL, MAX_ACCEL)
+            new_speed = clamp(current_speed + acceleration * dt, 0.0, MAX_SPEED)
+            desired_steering = atan(2 * wheelbase * sin(alpha) / lookahead_dist)
+        end
 
-            # Update target map segment and ego vehicle id from the received message
-            target_map_segment = measurement_msg.target_segment
-            ego_vehicle_id = measurement_msg.vehicle_id
+        steering_delta = desired_steering - prev_steering_angle
+        clamped_delta = clamp(steering_delta, -MAX_STEERING_RATE*dt, MAX_STEERING_RATE*dt)
+        current_steering = prev_steering_angle + clamped_delta
+        prev_steering_angle = current_steering
 
-            # Dispatch measurements to the corresponding channels
-            for meas in measurement_msg.measurements
-                if meas isa GPSMeasurement
-                    if !isfull(gps_channel)
-                        put!(gps_channel, meas)
-                    end
-                elseif meas isa IMUMeasurement
-                    if !isfull(imu_channel)
-                        put!(imu_channel, meas)
-                    end
-                elseif meas isa CameraMeasurement
-                    if !isfull(cam_channel)
-                        put!(cam_channel, meas)
-                    end
-                elseif meas isa GroundTruthMeasurement
-                    if !isfull(gt_channel)
-                        put!(gt_channel, meas)
-                    end
-                end
+        serialize(sock, (current_steering, new_speed, true))
+        sleep(dt)
+    end
+end
+
+function my_client(host::IPAddr=IPv4(0), port=4444)
+    socket = Sockets.connect(host, port)
+    map_segments = VehicleSim.city_map()
+    
+    msg = deserialize(socket) # Visualization info
+    @info msg
+
+    gps_channel = Channel{GPSMeasurement}(32)
+    imu_channel = Channel{IMUMeasurement}(32)
+    cam_channel = Channel{CameraMeasurement}(32)
+    gt_channel = Channel{GroundTruthMeasurement}(32)
+
+    #localization_state_channel = Channel{MyLocalizationType}(1)
+    #perception_state_channel = Channel{MyPerceptionType}(1)
+
+    target_map_segment = 0 # (not a valid segment, will be overwritten by message)
+    ego_vehicle_id = 0 # (not a valid id, will be overwritten by message. This is used for discerning ground-truth messages)
+
+    errormonitor(@async while true
+        # This while loop reads to the end of the socket stream (makes sure you
+        # are looking at the latest messages)
+        sleep(0.001)
+        local measurement_msg
+        received = false
+        while true
+            @async eof(socket)
+            if bytesavailable(socket) > 0
+                measurement_msg = deserialize(socket)
+                received = true
+            else
+                break
             end
         end
-    end
+        !received && continue
+        target_map_segment = measurement_msg.target_segment
+        ego_vehicle_id = measurement_msg.vehicle_id
+        for meas in measurement_msg.measurements
+            if meas isa GPSMeasurement
+                !isfull(gps_channel) && put!(gps_channel, meas)
+            elseif meas isa IMUMeasurement
+                !isfull(imu_channel) && put!(imu_channel, meas)
+            elseif meas isa CameraMeasurement
+                !isfull(cam_channel) && put!(cam_channel, meas)
+            elseif meas isa GroundTruthMeasurement
+                !isfull(gt_channel) && put!(gt_channel, meas)
+            end
+        end
+    end)
 
-    # Create a shutdown channel for the localize function
-    shutdown_channel = Channel{Bool}(1)
-
-    # Launch asynchronous tasks for localization, perception, and decision making.
-    @async localize(gps_channel, imu_channel, localization_state_channel, shutdown_channel)
-    # Note: perception function requires ekf and cnn_model; placeholders (nothing) are used here.
-    @async perception(cam_channel, localization_state_channel, perception_state_channel, shutdown_channel)
-    # Launch decision making with localization state, perception state, map segments, target segment, and socket.
-    @async decision_making(localization_state_channel, perception_state_channel, map_segments, target_map_segment, socket)
+    errormonitor(@async localize(gps_channel, imu_channel, localization_state_channel))
+    errormonitor(@async perception(cam_channel, localization_state_channel, perception_state_channel))
+    errormonitor(@async decision_making(localization_state_channel, perception_state_channel, map, socket))
 end
