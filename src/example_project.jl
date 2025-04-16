@@ -94,7 +94,7 @@ function collision_avoidance_control(ego::MyLocalizationType,
     safety_distance = 8.0
     factor = 1.0
     forward = SVector(cos(ego.yaw), sin(ego.yaw))
-    for obj in perc.detected_objs
+    for obj in perc.detections
         rel = obj.position - ego.position[1:2]
         dist_ahead = dot(rel, forward)
         if dist_ahead>0 && dist_ahead<safety_distance
