@@ -57,7 +57,6 @@ end
 struct MyPerceptionType
     timestamp::Float64
     detections::Vector{Detected_Obj}
-    estimated_region::NTuple{4, Float64}
 end
 
 function within_lane(pos::SVector{2,Float64}, seg::VehicleSim.RoadSegment)
@@ -639,8 +638,27 @@ function perception(cam_meas_channel, localization_state_channel, perception_sta
             est_obj_loc = ego_position
         end
 
-        detected_object = Detected_Obj(1, bbox, 1.0, "vehicle", est_obj_loc[1:2], SVector(0.0,0.0))
+        # detected_object = Detected_Obj(1, bbox, 1.0, "vehicle", est_obj_loc[1:2], SVector(0.0,0.0))
 
+        x_mean = sum(p.loc[1] * p.w for p in particles)
+        y_mean = sum(p.loc[2] * p.w for p in particles)
+        center = SVector(x_mean, y_mean)
+
+        cov_xx = sum(p.w * (p.loc[1] - x_mean)^2 for p in particles)
+        cov_yy = sum(p.w * (p.loc[2] - y_mean)^2 for p in particles)
+        cov_xy = sum(p.w * (p.loc[1] - x_mean)*(p.loc[2] - y_mean) for p in particles)
+        pos_cov = [cov_xx cov_xy; cov_xy cov_yy]
+
+        detected_object = Detected_Obj(
+            1,
+            bbox,
+            1.0,
+            "vehicle",
+            center,
+            SVector(0.0,0.0),     
+            pos_cov,           
+            "camera"
+        )
         # detected_object = Detected_Obj(1, true_bboxes_cam1 != [] ? true_bboxes_cam1[1] : (0.0,0.0,0.0,0.0),
         #                                 1.0, "vehicle", est_obj_loc[1:2], SVector(0.0,0.0))
     
@@ -653,7 +671,7 @@ function perception(cam_meas_channel, localization_state_channel, perception_sta
                                          T_body_camrot1, T_body_camrot2,
                                          image_width, image_height, pixel_len)
 
-        perception_msg = MyPerceptionType(time(), [detected_object], estimated_region)
+        perception_msg = MyPerceptionType(time(), [detected_object])
 
         if isready(perception_state_channel)
             take!(perception_state_channel)
