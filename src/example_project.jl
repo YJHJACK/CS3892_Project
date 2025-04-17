@@ -390,6 +390,7 @@ function estimate_location_from_2_bboxes(ego_quaternion::SVector{4,Float64},
 end
 
 function predict_bboxes(quat, loc, T_body_camrot, image_width=640, image_height=480, pixel_len=0.001)
+    focal_len=0.64
     object_width = image_width * pixel_len   
     object_height = image_height * pixel_len   
     object_depth = 1.0                          
@@ -461,7 +462,10 @@ function quaternion_to_yaw(q::SVector{4,Float64})
     return atan(2*(q[1]*q[4] + q[2]*q[3]), 1 - 2*(q[3]^2 + q[4]^2))
 end
 
-function bboxes_error(pred_bboxes::Vector{NTuple{4,Float64}}, true_bboxes::Vector{NTuple{4,Float64}})
+function bboxes_error(pred_bboxes, true_bboxes)
+    if isempty(pred_bboxes) || isempty(true_bboxes)
+        return Inf
+    end
     p = pred_bboxes[1]
     t = true_bboxes[1]
     return abs(p[1]-t[1]) + abs(p[2]-t[2]) + abs(p[3]-t[3]) + abs(p[4]-t[4])
@@ -595,10 +599,33 @@ function estimate_object_state(ego_state, obj_bboxes::Vector{NTuple{4,Float64}};
     return estimated_orientation, estimated_location
 end
     
+function get_cam_transform(camera_id::Int)
+    R_cam_to_body = RotY(0.02)
+    t_cam_to_body = [1.35,  1.7, 2.4]
+    if camera_id == 2
+        t_cam_to_body[2] = -1.7
+    end
+    return hcat(R_cam_to_body, t_cam_to_body)
+end
+
+function get_rotated_camera_transform()
+    R = [ 0.0  0.0 1.0;
+         -1.0  0.0 0.0;
+          0.0 -1.0 0.0 ]
+    t = zeros(3)
+    [R t]
+end
+
+function multiply_transforms(T1, T2)
+    T1f = [T1; [0 0 0 1.]] 
+    T2f = [T2; [0 0 0 1.]]
+
+    T = T1f * T2f
+    T = T[1:3, :]
+end
 
 #particle & bbox perception function
 function perception(cam_meas_channel, localization_state_channel, perception_state_channel, shutdown_channel)
-    @info "perception..."
     # set up stuff
     last_time = time()
     particles = Particle[]
@@ -606,56 +633,68 @@ function perception(cam_meas_channel, localization_state_channel, perception_sta
         if isready(shutdown_channel)
             break
         end
-        fresh_cam_meas = []
+        fresh_cam_meas = CameraMeasurement[]
         while isready(cam_meas_channel)
-            meas = take!(cam_meas_channel)
-            push!(fresh_cam_meas, meas)
+            push!(fresh_cam_meas, take!(cam_meas_channel))
         end
 
         if isempty(fresh_cam_meas)
+            put!(perception_state_channel, MyPerceptionType(time(), Detected_Obj[]))
             sleep(0.005)
             continue
         end
-        current_meas = fresh_cam_meas[end]
-        true_bboxes_cam1 = haskey(current_meas, :bboxes_cam1) ? current_meas[:bboxes_cam1] : []
-        true_bboxes_cam2 = haskey(current_meas, :bboxes_cam2) ? current_meas[:bboxes_cam2] : []
+
+        if isready(localization_state_channel)
+            loc_state = take!(localization_state_channel)
+            ego_orientation = loc_state.yaw
+            ego_position    = loc_state.position
+        else
+            put!(perception_state_channel, MyPerceptionType(time(), Detected_Obj[]))
+            sleep(0.005)
+            continue
+        end
+
+        b1 = Vector{SVector{4,Int}}()
+        b2 = Vector{SVector{4,Int}}()
+        for fresh in fresh_cam_meas
+            @info fresh
+            if fresh.camera_id == 1
+                append!(b1, fresh.bounding_boxes)
+            else  
+                append!(b2, fresh.bounding_boxes)
+            end
+        end
 
         # calculate target pos
+        T1 = get_cam_transform(1)
+        T2 = get_cam_transform(2)
+        Tr = get_rotated_camera_transform()
+        T_body_camrot1 = multiply_transforms(T1, Tr)
+        T_body_camrot2 = multiply_transforms(T2, Tr)
+
         best_quat, best_loc, min_error, estimated_region =
             estimate_location_from_2_bboxes(ego_orientation, ego_position,
                                         T_body_camrot1, T_body_camrot2,
-                                        true_bboxes_cam1, true_bboxes_cam2)
+                                        b1, b2)
         sorted_candidates = sort!(quat_loc_bboxerror_list, by = x -> x[3])
         selected_candidates = sorted_candidates[1:min(10, length(sorted_candidates))]
 
         # initialize particles
-        particles = initialize_particles(selected_candidates, vehicle_size;
+        particles = initialize_particles(selected_candidates;
                                      varangle = pi/12, var_location = 0.5, 
                                      max_v = 7.5, step_v = 0.5, number_of_particles = 1000)
-    
-        # estimate object orientation, location
-        # if !isempty(true_bboxes_cam1) || !isempty(true_bboxes_cam2)
-        #     obj_bboxes = [true_bboxes_cam1[1]]
-        #     est_obj_ori, est_obj_loc = estimate_object_state(ego_state, obj_bboxes; scale_factor=pixel_len)
-        # else
-        #     # if no target, default to ego
-        #     est_obj_ori = ego_orientation
-        #     est_obj_loc = ego_position
-        # end
 
-        if !isempty(true_bboxes_cam1)
-            bbox = true_bboxes_cam1[1]
+        if !isempty(b1)
+            bbox = b1[1]
             est_obj_ori, est_obj_loc = estimate_object_state(ego_state, bbox; scale_factor=pixel_len)
-        elseif !isempty(true_bboxes_cam2)
-            bbox = true_bboxes_cam2[1]
+        elseif !isempty(b2)
+            bbox = b2[1]
             est_obj_ori, est_obj_loc = estimate_object_state(ego_state, bbox; scale_factor=pixel_len)
         else
             bbox = (0.0, 0.0, 0.0, 0.0)
             est_obj_ori = ego_orientation
             est_obj_loc = ego_position
         end
-
-        # detected_object = Detected_Obj(1, bbox, 1.0, "vehicle", est_obj_loc[1:2], SVector(0.0,0.0))
 
         x_mean = sum(p.loc[1] * p.w for p in particles)
         y_mean = sum(p.loc[2] * p.w for p in particles)
@@ -676,14 +715,12 @@ function perception(cam_meas_channel, localization_state_channel, perception_sta
             pos_cov,           
             "camera"
         )
-        # detected_object = Detected_Obj(1, true_bboxes_cam1 != [] ? true_bboxes_cam1[1] : (0.0,0.0,0.0,0.0),
-        #                                 1.0, "vehicle", est_obj_loc[1:2], SVector(0.0,0.0))
     
         # update particles
         delta_t = time() - last_time
         last_time = time()
         updated_particles = update_particles(particles, delta_t,
-                                         true_bboxes_cam1, true_bboxes_cam2,
+                                         b1, b2,
                                          ego_orientation, ego_position,
                                          T_body_camrot1, T_body_camrot2,
                                          image_width, image_height, pixel_len)
