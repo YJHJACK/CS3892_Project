@@ -349,20 +349,20 @@ function localize(gps_ch::Channel{GPSMeasurement}, imu_ch::Channel{IMUMeasuremen
 end
 
 #given quaternion, location, bboxes from 2 cams, return estimated location region
-function estimate_location_from_2_bboxes(ego_quaternion::SVector{4,Float64},
+function estimate_location_from_2_bboxes(ego_quaternion,
     ego_position::SVector{3,Float64},
     T_body_camrot1, T_body_camrot2,
-    true_bboxes_cam1::Vector{NTuple{4,Float64}},
-    true_bboxes_cam2::Vector{NTuple{4,Float64}})
+    true_bboxes_cam1,
+    true_bboxes_cam2)
 
     quat_loc_bboxerror_list = []
-    base_yaw = quaternion_to_yaw(ego_quaternion)
+    base_yaw = ego_quaternion
     for dyaw in range(-0.3, 0.3, length=5)   
         for dx in range(-1.0, 1.0, length=5) 
             for dy in range(-1.0, 1.0, length=5)
                 # construction
                 candidate_yaw = base_yaw + dyaw
-                candidate_quat = yaw_to_quaternion(candidate_yaw)
+                candidate_quat = VehicleSim.yaw_to_quaternion(candidate_yaw)
                 candidate_loc = SVector(ego_position[1] + dx, ego_position[2] + dy, ego_position[3])
 
                 # 2. predict bbox on canmera besed on pose
@@ -390,7 +390,7 @@ function estimate_location_from_2_bboxes(ego_quaternion::SVector{4,Float64},
     estimated_region = (best_loc[1] - margin, best_loc[2] - margin,
     best_loc[1] + margin, best_loc[2] + margin)
 
-    return best_quat, best_loc, min_error, estimated_region
+    return best_quat, best_loc, min_error, estimated_region, quat_loc_bboxerror_list
 end
 
 function predict_bboxes(quat, loc, T_body_camrot, image_width=640, image_height=480, pixel_len=0.001)
@@ -414,8 +414,8 @@ function predict_bboxes(quat, loc, T_body_camrot, image_width=640, image_height=
         proj_x = focal_len * X_cam[1] / Z
         proj_y = focal_len * X_cam[2] / Z
     
-        px = convert_to_pixel(image_width, pixel_len, proj_x)
-        py = convert_to_pixel(image_height, pixel_len, proj_y)
+        px = VehicleSim.convert_to_pixel(image_width, pixel_len, proj_x)
+        py = VehicleSim.convert_to_pixel(image_height, pixel_len, proj_y)
     
         push!(projected_points, (px, py))
     end
@@ -451,21 +451,6 @@ function compute_3d_corners(quat, loc, object_size)
     return [vcat(corner, 1.0) for corner in corners]
 end
 
-function convert_to_pixel(num_pixels, pixel_len, px)
-    min_val = -pixel_len*num_pixels/2
-    pix_id = cld(px - min_val, pixel_len)+1 |> Int
-    return pix_id
-end
-
-function yaw_to_quaternion(yaw::Float64)
-    half = yaw / 2
-    return SVector(cos(half), 0.0, 0.0, sin(half))
-end
-
-function quaternion_to_yaw(q::SVector{4,Float64})
-    return atan(2*(q[1]*q[4] + q[2]*q[3]), 1 - 2*(q[3]^2 + q[4]^2))
-end
-
 function bboxes_error(pred_bboxes, true_bboxes)
     if isempty(pred_bboxes) || isempty(true_bboxes)
         return Inf
@@ -484,7 +469,7 @@ function initialize_particles(quat_loc_minerror_list; var_location=0.5,var_angle
 
     for (quat, loc, min_err) in quat_loc_minerror_list
         # 1. turn quaterion to yaw
-        base_angle = quaternion_to_yaw(quat)
+        base_angle = VehicleSim.quaternion_to_yaw(quat)
 
         # mean = [ base_angle, loc[1], loc[2] ]
         # cov  = diagm([var_angle^2, var_location^2, var_location^2])
@@ -548,7 +533,7 @@ function update_particles(particles::Vector{Particle},
         new_angle = p.angle + randn()*0.01
         
         # trajection
-        quat_new = yaw_to_quaternion(new_angle)
+        quat_new = VehicleSim.yaw_to_quaternion(new_angle)
         # predict bbox
         pred_bboxes_cam1 = predict_bboxes(quat_new, new_loc, T_body_camrot1, image_width, image_height, pixel_len)
         pred_bboxes_cam2 = predict_bboxes(quat_new, new_loc, T_body_camrot2, image_width, image_height, pixel_len)
@@ -602,37 +587,18 @@ function estimate_object_state(ego_state, obj_bboxes::Vector{NTuple{4,Float64}};
 
     return estimated_orientation, estimated_location
 end
-    
-function get_cam_transform(camera_id::Int)
-    R_cam_to_body = RotY(0.02)
-    t_cam_to_body = [1.35,  1.7, 2.4]
-    if camera_id == 2
-        t_cam_to_body[2] = -1.7
-    end
-    return hcat(R_cam_to_body, t_cam_to_body)
-end
-
-function get_rotated_camera_transform()
-    R = [ 0.0  0.0 1.0;
-         -1.0  0.0 0.0;
-          0.0 -1.0 0.0 ]
-    t = zeros(3)
-    [R t]
-end
-
-function multiply_transforms(T1, T2)
-    T1f = [T1; [0 0 0 1.]] 
-    T2f = [T2; [0 0 0 1.]]
-
-    T = T1f * T2f
-    T = T[1:3, :]
-end
 
 #particle & bbox perception function
 function perception(cam_meas_channel, localization_state_channel, perception_state_channel, shutdown_channel)
     # set up stuff
     last_time = time()
     particles = Particle[]
+    # calculate target pos
+    T1 = VehicleSim.get_cam_transform(1)
+    T2 = VehicleSim.get_cam_transform(2)
+    Tr = VehicleSim.get_rotated_camera_transform()
+    T_body_camrot1 = VehicleSim.multiply_transforms(T1, Tr)
+    T_body_camrot2 = VehicleSim.multiply_transforms(T2, Tr)
     while true
         if isready(shutdown_channel)
             break
@@ -669,14 +635,9 @@ function perception(cam_meas_channel, localization_state_channel, perception_sta
             end
         end
 
-        # calculate target pos
-        T1 = get_cam_transform(1)
-        T2 = get_cam_transform(2)
-        Tr = get_rotated_camera_transform()
-        T_body_camrot1 = multiply_transforms(T1, Tr)
-        T_body_camrot2 = multiply_transforms(T2, Tr)
+        
 
-        best_quat, best_loc, min_error, estimated_region =
+        best_quat, best_loc, min_error, estimated_region, quat_loc_bboxerror_list =
             estimate_location_from_2_bboxes(ego_orientation, ego_position,
                                         T_body_camrot1, T_body_camrot2,
                                         b1, b2)
@@ -684,9 +645,7 @@ function perception(cam_meas_channel, localization_state_channel, perception_sta
         selected_candidates = sorted_candidates[1:min(10, length(sorted_candidates))]
 
         # initialize particles
-        particles = initialize_particles(selected_candidates;
-                                     varangle = pi/12, var_location = 0.5, 
-                                     max_v = 7.5, step_v = 0.5, number_of_particles = 1000)
+        particles = initialize_particles(selected_candidates)
 
         if !isempty(b1)
             bbox = b1[1]
