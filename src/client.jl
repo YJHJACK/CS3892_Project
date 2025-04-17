@@ -198,83 +198,88 @@ end
 
 # function auto_client(host::IPAddr = IPv4(0), port::Int = 4444; ego_id::Int = 1)
 #     ########################################################################
-#     # 0. 连接 simulator
+#     # 0. 连接模拟器，保持静止
 #     ########################################################################
 #     sock = Sockets.connect(host, port)
 #     info_msg = deserialize(sock)
-#     @info "Connected to simulator:" info_msg = info_msg
+#     @info "Connected to simulator" info_msg = info_msg
 
-#     serialize(sock, (0.0, 0.0, true))       # 先保持静止
+#     serialize(sock, (0.0, 0.0, true))     # 第一道指令：停在原地
 #     @info "Sent initial zero‑speed command"
 
 #     ########################################################################
-#     # 1. 频道
+#     # 1. 各类 Channel
 #     ########################################################################
 #     gps_ch      = Channel{GPSMeasurement}(32)
 #     imu_ch      = Channel{IMUMeasurement}(32)
 #     cam_ch      = Channel{CameraMeasurement}(32)
 #     loc_ch      = Channel{MyLocalizationType}(32)
 #     perc_ch     = Channel{MyPerceptionType}(32)
-#     shutdown_ch = Channel{Bool}(1)
+#     sd_ch       = Channel{Bool}(1)
 
 #     ########################################################################
-#     # 2. EKF + 感知线程
+#     # 2. 后台线程：EKF + 感知
 #     ########################################################################
-#     errormonitor(@async localize(gps_ch, imu_ch, loc_ch, shutdown_ch))
-#     errormonitor(@async perception(cam_ch, loc_ch, perc_ch, shutdown_ch))
+#     errormonitor(@async localize(gps_ch, imu_ch, loc_ch, sd_ch))
+#     errormonitor(@async perception(cam_ch, loc_ch, perc_ch, sd_ch))
 
 #     ########################################################################
-#     # 3. 读取 socket 线程
+#     # 3. 后台线程：读取 socket → 推送最新测量
 #     ########################################################################
-#     put_latest!(ch, val) = (isready(ch) && take!(ch); put!(ch, val))
+#     put_latest!(ch, v) = (isready(ch) && take!(ch); put!(ch, v))
 
 #     errormonitor(@async begin
 #         while isopen(sock)
 #             msg = try
 #                 deserialize(sock)::VehicleSim.MeasurementMessage
 #             catch e
-#                 @warn "Failed to deserialize, retrying..." error = e
+#                 @warn "Failed to deserialize, retrying…" error = e
 #                 continue
 #             end
-
-#             # 把各类测量塞进对应通道
 #             for m in msg.measurements
-#                 m isa GPSMeasurement        && put_latest!(gps_ch,  m)
-#                 m isa IMUMeasurement        && put_latest!(imu_ch,  m)
-#                 m isa CameraMeasurement     && put_latest!(cam_ch,  m)
-#             end
-
-#             # ⚠️ 立即用 Ground‑Truth 给 loc_ch “打底”
-#             for m in msg.measurements
-#                 if m isa GroundTruthMeasurement && m.vehicle_id == ego_id
-#                     gt_loc = MyLocalizationType(
-#                         true,
-#                         m.position,
-#                         VehicleSim.extract_yaw_from_quaternion(m.orientation),
-#                         m.velocity,
-#                         zeros(6, 6),          # dummy cov
-#                         m.time
-#                     )
-#                     put_latest!(loc_ch, gt_loc)
-#                     break                         # 只要一条即可
-#                 end
+#                 m isa GPSMeasurement    && put_latest!(gps_ch,  m)
+#                 m isa IMUMeasurement    && put_latest!(imu_ch,  m)
+#                 m isa CameraMeasurement && put_latest!(cam_ch,  m)
 #             end
 #         end
-#         put!(shutdown_ch, true)
+#         put!(sd_ch, true)
 #     end)
 
 #     ########################################################################
-#     # 4. 生成目标 & 启动决策
+#     # 4. 等 EKF 第一帧定位；未就绪时持续发 0 速
+#     ########################################################################
+#     t_start   = time()
+#     loc0      = nothing
+#     wait_time = 0.0
+#     while loc0 === nothing && isopen(sock)
+#         if isready(loc_ch)
+#             loc0 = take!(loc_ch)          # 取出 EKF 的第一帧
+#             put!(loc_ch, loc0)            # 放回去，让 planner 能拿到
+#             break
+#         end
+#         serialize(sock, (0.0, 0.0, true))
+#         sleep(0.05)
+#         wait_time = time() - t_start
+#         if wait_time > 3.0
+#             @warn "EKF has not produced a state after 3 s; still waiting…"
+#             t_start = time()              # 重新计时，继续等
+#         end
+#     end
+#     loc0 === nothing && error("Socket closed before EKF initialized.")
+
+#     @info "EKF ready after $(round(wait_time, digits = 2)) s — planner starting"
+
+#     ########################################################################
+#     # 5. 生成目标并启动决策线程
 #     ########################################################################
 #     map     = VehicleSim.city_map()
-#     targets = VehicleSim.identify_loading_segments(map)
-#     @assert !isempty(targets) "No loading segments found!"
-#     tgt = rand(targets)
+#     tgt     = rand(VehicleSim.identify_loading_segments(map))
 #     @info "Driving to target segment:" target_segment = tgt
 
 #     @async decision_making(loc_ch, perc_ch, map, tgt, sock)
 #     return nothing
 # end
+
 
 function auto_client(host::IPAddr=IPv4(0), port::Int=4444; ego_id::Int=1)
     sock = Sockets.connect(host, port)
