@@ -4,6 +4,10 @@ using Interpolations
 using VehicleSim
 using LinearAlgebra
 using Plots
+using VehicleSim:
+    f, Jac_x_f,
+    h_gps, Jac_h_gps,
+    extract_yaw_from_quaternion
 
 mutable struct PIDController
     Kp::Float64
