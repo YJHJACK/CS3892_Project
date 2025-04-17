@@ -274,6 +274,21 @@ function auto_client(host::IPAddr=IPv4(0), port::Int=4444; ego_id::Int=1)
     @info "Driving to target segment:" target_segment=tgt
 
     @async decision_making(loc_ch, perc_ch, map, tgt, sock)
+
+    @async begin
+        @info "Press 'q' to quit."
+        while isopen(sock)
+            c = get_c()
+            if c == 'q'
+                @info "User requested shutdown."
+                # tell simulator to stop and disconnect
+                serialize(sock, (0.0, 0.0, false))
+                close(sock)
+                @info "Terminating Keyboard Client."
+                break
+            end
+        end
+    end
 end
 
 function channel_full(ch::Channel)
