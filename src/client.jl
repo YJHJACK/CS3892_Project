@@ -195,6 +195,87 @@ end
 #     return nothing
 # end
 
+
+# function auto_client(host::IPAddr = IPv4(0), port::Int = 4444; ego_id::Int = 1)
+#     ########################################################################
+#     # 0. 连接 simulator
+#     ########################################################################
+#     sock = Sockets.connect(host, port)
+#     info_msg = deserialize(sock)
+#     @info "Connected to simulator:" info_msg = info_msg
+
+#     serialize(sock, (0.0, 0.0, true))       # 先保持静止
+#     @info "Sent initial zero‑speed command"
+
+#     ########################################################################
+#     # 1. 频道
+#     ########################################################################
+#     gps_ch      = Channel{GPSMeasurement}(32)
+#     imu_ch      = Channel{IMUMeasurement}(32)
+#     cam_ch      = Channel{CameraMeasurement}(32)
+#     loc_ch      = Channel{MyLocalizationType}(32)
+#     perc_ch     = Channel{MyPerceptionType}(32)
+#     shutdown_ch = Channel{Bool}(1)
+
+#     ########################################################################
+#     # 2. EKF + 感知线程
+#     ########################################################################
+#     errormonitor(@async localize(gps_ch, imu_ch, loc_ch, shutdown_ch))
+#     errormonitor(@async perception(cam_ch, loc_ch, perc_ch, shutdown_ch))
+
+#     ########################################################################
+#     # 3. 读取 socket 线程
+#     ########################################################################
+#     put_latest!(ch, val) = (isready(ch) && take!(ch); put!(ch, val))
+
+#     errormonitor(@async begin
+#         while isopen(sock)
+#             msg = try
+#                 deserialize(sock)::VehicleSim.MeasurementMessage
+#             catch e
+#                 @warn "Failed to deserialize, retrying..." error = e
+#                 continue
+#             end
+
+#             # 把各类测量塞进对应通道
+#             for m in msg.measurements
+#                 m isa GPSMeasurement        && put_latest!(gps_ch,  m)
+#                 m isa IMUMeasurement        && put_latest!(imu_ch,  m)
+#                 m isa CameraMeasurement     && put_latest!(cam_ch,  m)
+#             end
+
+#             # ⚠️ 立即用 Ground‑Truth 给 loc_ch “打底”
+#             for m in msg.measurements
+#                 if m isa GroundTruthMeasurement && m.vehicle_id == ego_id
+#                     gt_loc = MyLocalizationType(
+#                         true,
+#                         m.position,
+#                         VehicleSim.extract_yaw_from_quaternion(m.orientation),
+#                         m.velocity,
+#                         zeros(6, 6),          # dummy cov
+#                         m.time
+#                     )
+#                     put_latest!(loc_ch, gt_loc)
+#                     break                         # 只要一条即可
+#                 end
+#             end
+#         end
+#         put!(shutdown_ch, true)
+#     end)
+
+#     ########################################################################
+#     # 4. 生成目标 & 启动决策
+#     ########################################################################
+#     map     = VehicleSim.city_map()
+#     targets = VehicleSim.identify_loading_segments(map)
+#     @assert !isempty(targets) "No loading segments found!"
+#     tgt = rand(targets)
+#     @info "Driving to target segment:" target_segment = tgt
+
+#     @async decision_making(loc_ch, perc_ch, map, tgt, sock)
+#     return nothing
+# end
+
 function auto_client(host::IPAddr=IPv4(0), port::Int=4444; ego_id::Int=1)
     sock = Sockets.connect(host, port)
     info_msg = deserialize(sock)
