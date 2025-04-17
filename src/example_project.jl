@@ -4,7 +4,6 @@ using Interpolations
 using VehicleSim
 using LinearAlgebra
 using Plots
-using VehicleSim: f, Jac_x_f, h_gps, Jac_h_gps, extract_yaw_from_quaternion
 
 mutable struct PIDController
     Kp::Float64
@@ -69,7 +68,6 @@ function within_lane(pos::SVector{2,Float64}, seg::VehicleSim.RoadSegment)
         C = seg.lane_boundaries[3].pt_a
         D = seg.lane_boundaries[3].pt_b
     elseif nb == 2
-        # Fall back on the first and second boundaries.
         A = seg.lane_boundaries[1].pt_a
         B = seg.lane_boundaries[1].pt_b
         C = seg.lane_boundaries[2].pt_a
@@ -85,6 +83,22 @@ function within_lane(pos::SVector{2,Float64}, seg::VehicleSim.RoadSegment)
     max_y = max(A[2], B[2], C[2], D[2])
     
     return (min_x <= pos[1] <= max_x) && (min_y <= pos[2] <= max_y)
+end
+
+function collision_avoidance_control(ego::MyLocalizationType,
+    perc::MyPerceptionType,
+    planned_vel::Float64)
+    safety_distance = 8.0
+    factor = 1.0
+    forward = SVector(cos(ego.yaw), sin(ego.yaw))
+    for obj in perc.detected_objs
+        rel = obj.position - ego.position[1:2]
+        dist_ahead = dot(rel, forward)
+        if dist_ahead>0 && dist_ahead<safety_distance
+            factor = min(factor, dist_ahead/safety_distance)
+        end
+    end
+    return planned_vel*factor
 end
 
 function least_lane_path(all_segs::Dict{Int,VehicleSim.RoadSegment}, start_id::Int, goal_id::Int)
@@ -180,6 +194,9 @@ function compute_segment_straight_points(seg::VehicleSim.RoadSegment, target_id:
     return points
 end
 
+# Generate a smooth trajectory from a list of segments.
+# For each segment, if the curvature is negligible the segment is treated as straight;
+# otherwise it is treated as curved.
 function generate_trajectory_plan(segments::Vector{VehicleSim.RoadSegment}, target_id::Int)
     raw_pts = SVector{2,Float64}[]
 
@@ -216,7 +233,7 @@ function generate_trajectory_plan(segments::Vector{VehicleSim.RoadSegment}, targ
     end
     total_length = cum_dists[end]
     
-    num_samples = 200
+    num_samples = 500
     sample_dists = range(0, stop=total_length, length=num_samples)
     sampled_points = SVector{2,Float64}[]
     
@@ -687,7 +704,7 @@ function find_current_segment(pos2d::SVector{2,Float64}, map::Dict{Int,VehicleSi
             return seg_id
         end
     end
-    error("No segment found containing position $pos2d")
+    return nothing
 end
 
 function find_target_point(traj_points, current_pos, lookahead_dist)
@@ -739,10 +756,7 @@ function decision_making(loc_ch, perc_ch, map::Dict{Int,VehicleSim.RoadSegment},
     STEERING_ERROR_THRESHOLD = 0.05
     STEERING_RECOVER_THRESHOLD = 0.03
     
-    @info "Localization Fetch1 Starts"
     loc0 = fetch(loc_ch)
-    @info "Localization Fetch1 Ends"
-
     p0 = SVector(loc0.position[1], loc0.position[2])
     s0 = find_current_segment(p0, map)
     route = least_lane_path(map, s0, target_seg)
@@ -750,12 +764,8 @@ function decision_making(loc_ch, perc_ch, map::Dict{Int,VehicleSim.RoadSegment},
     traj = generate_trajectory_plan(segs, target_seg)
     traj_points = [SVector{2}(p[1], p[2]) for p in traj]
 
-    # put!(perc_ch, MyPerceptionType(time(), Detected_Obj[], ))
-
     while isopen(sock)
-        @info "Localization Fetch2 Starts"
         loc = fetch(loc_ch)
-        @info "Localization Fetch2 Ends"
         perc = fetch(perc_ch)
         
         if !loc.valid
@@ -766,7 +776,10 @@ function decision_making(loc_ch, perc_ch, map::Dict{Int,VehicleSim.RoadSegment},
 
         current_pos = SVector(loc.position[1], loc.position[2])
         current_seg_id = find_current_segment(current_pos, map)
-        current_seg = map[current_seg_id]
+        current_seg = nothing
+        if current_seg_id ≠ nothing
+            current_seg = map[current_seg_id]
+        end
         current_heading = loc.yaw
         current_speed = norm(SVector(loc.velocity[1], loc.velocity[2]))
         
@@ -806,6 +819,8 @@ function decision_making(loc_ch, perc_ch, map::Dict{Int,VehicleSim.RoadSegment},
             continue
         end
 
+        # ========================================
+
         #break if there is a stop sign
         # ========================================
         if current_seg ≠ nothing && stop_counter == 0
@@ -835,21 +850,23 @@ function decision_making(loc_ch, perc_ch, map::Dict{Int,VehicleSim.RoadSegment},
         if stop_counter > 0
             stop_counter -= 0.01
         end
+        
+        # ========================================
 
         #break if we arrive
         # ========================================
         end_point = traj_points[end]
         distance_to_end = norm(current_pos - end_point)
-        if !is_braking && distance_to_end ≤ 10.0
+        if !is_braking && distance_to_end ≤ 5.0
             is_braking = true
             @info "start to break"
         end
 
         if is_braking
-            target_speed = if distance_to_end ≤ 10.0
+            target_speed = if distance_to_end ≤ 5.0
                 0.0
             else
-                lerp(current_speed, 0.0, (BRAKING_DISTANCE - distance_to_end)/5.0)
+                lerp(current_speed, 0.0, (5.0 - distance_to_end)/5.0)
             end
 
             speed_error = target_speed - current_speed
@@ -859,7 +876,7 @@ function decision_making(loc_ch, perc_ch, map::Dict{Int,VehicleSim.RoadSegment},
 
             serialize(sock, (0.0, 0.0, true))
 
-            if new_speed ≤ 0.05
+            if new_speed ≤ STOP_SPEED_THRESHOLD
                 serialize(sock, (0.0, 0.0, false))
                 @info "stopped, end loop"
                 break
@@ -868,8 +885,9 @@ function decision_making(loc_ch, perc_ch, map::Dict{Int,VehicleSim.RoadSegment},
             sleep(dt)
             continue
         end
+        # ========================================
         
-        lookahead_dist = 6.0
+        lookahead_dist = 5.0
         target_point = find_target_point(traj_points, current_pos, lookahead_dist)
         
         vec = target_point - current_pos
@@ -880,7 +898,9 @@ function decision_making(loc_ch, perc_ch, map::Dict{Int,VehicleSim.RoadSegment},
         alpha = target_alpha
         alpha = alpha - 2π * floor((alpha + π) / (2π))
         
+        # 转向状态机
         if !is_steering_adjustment && abs(alpha) > STEERING_ERROR_THRESHOLD
+            @info "$(round(alpha, digits=3))"
             is_steering_adjustment = true
             speed_pid.integral = 0.0
         end
@@ -893,6 +913,7 @@ function decision_making(loc_ch, perc_ch, map::Dict{Int,VehicleSim.RoadSegment},
             desired_steering = atan(2 * wheelbase * sin(alpha) / lookahead_dist)
             
             if abs(alpha) ≤ STEERING_RECOVER_THRESHOLD
+                @info "转向调整完成"
                 is_steering_adjustment = false
             end
         else
@@ -900,10 +921,8 @@ function decision_making(loc_ch, perc_ch, map::Dict{Int,VehicleSim.RoadSegment},
             speed_error = target_speed - current_speed
             acceleration = pid_update(speed_pid, speed_error, dt)
             acceleration = clamp(acceleration, -MAX_ACCEL, MAX_ACCEL)
-            if(stop_counter >3.0)
-                acceleration = acceleration * 10
-            end
-            new_speed = clamp(current_speed + acceleration * dt * 2, 0.0, MAX_SPEED)
+            
+            new_speed = clamp(current_speed + acceleration * dt, 0.0, MAX_SPEED)
             desired_steering = atan(2 * wheelbase * sin(alpha) / lookahead_dist)
         end
 
@@ -966,7 +985,7 @@ function my_client(host::IPAddr=IPv4(0), port=4444)
         end
     end)
 
-    errormonitor(@async localize(gps_channel, imu_channel, localization_state_channel))
-    errormonitor(@async perception(cam_channel, localization_state_channel, perception_state_channel))
-    errormonitor(@async decision_making(localization_state_channel, perception_state_channel, map, socket))
+    @async localize(gps_channel, imu_channel, localization_state_channel)
+    @async perception(cam_channel, localization_state_channel, perception_state_channel)
+    @async decision_making(localization_state_channel, perception_state_channel, map, socket)
 end
