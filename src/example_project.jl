@@ -88,22 +88,6 @@ function within_lane(pos::SVector{2,Float64}, seg::VehicleSim.RoadSegment)
     return (min_x <= pos[1] <= max_x) && (min_y <= pos[2] <= max_y)
 end
 
-function collision_avoidance_control(ego::MyLocalizationType,
-    perc::MyPerceptionType,
-    planned_vel::Float64)
-    safety_distance = 8.0
-    factor = 1.0
-    forward = SVector(cos(ego.yaw), sin(ego.yaw))
-    for obj in perc.detections
-        rel = obj.position - ego.position[1:2]
-        dist_ahead = dot(rel, forward)
-        if dist_ahead>0 && dist_ahead<safety_distance
-            factor = min(factor, dist_ahead/safety_distance)
-        end
-    end
-    return planned_vel*factor
-end
-
 function least_lane_path(all_segs::Dict{Int,VehicleSim.RoadSegment}, start_id::Int, goal_id::Int)
     queue = Queue{Int}()
     enqueue!(queue, start_id)
@@ -182,24 +166,28 @@ function compute_segment_arc_points(seg::VehicleSim.RoadSegment, npts::Int=1)
     return pts
 end
 
-function compute_segment_straight_points(seg::VehicleSim.RoadSegment)
+function compute_segment_straight_points(seg::VehicleSim.RoadSegment, target_id::Int)
     lb1 = seg.lane_boundaries[1]
     lb2 = seg.lane_boundaries[2]
+    if(seg.id == target_id)
+        lb1 = seg.lane_boundaries[2]
+        lb2 = seg.lane_boundaries[3]
+    end
     start_center = 0.5 * (lb1.pt_a + lb2.pt_a)
     end_center   = 0.5 * (lb1.pt_b + lb2.pt_b)
-    return [start_center[1:2], end_center[1:2]]
+    t_vals = range(0.0, 1.0, 5)
+
+    points = [ start_center .+ τ .* (end_center .- start_center) for τ in t_vals ]
+    return points
 end
 
-# Generate a smooth trajectory from a list of segments.
-# For each segment, if the curvature is negligible the segment is treated as straight;
-# otherwise it is treated as curved.
-function generate_trajectory_plan(segments::Vector{VehicleSim.RoadSegment})
+function generate_trajectory_plan(segments::Vector{VehicleSim.RoadSegment}, target_id::Int)
     raw_pts = SVector{2,Float64}[]
 
     for (i, seg) in enumerate(segments)
         lb = seg.lane_boundaries[1]
         pts = if isapprox(lb.curvature, 0.0; atol=1e-6)
-            compute_segment_straight_points(seg)
+            compute_segment_straight_points(seg, target_id)
         else
             compute_segment_arc_points(seg, 1)
         end
@@ -251,7 +239,6 @@ function generate_trajectory_plan(segments::Vector{VehicleSim.RoadSegment})
     return sampled_points
 end
 
-# Ground Truth 处理
 function process_gt(gt_ch, sd_ch, loc_ch, perc_ch)
     while true
         fetch(sd_ch) && break
@@ -261,14 +248,12 @@ function process_gt(gt_ch, sd_ch, loc_ch, perc_ch)
     end
 end
 
-# 归一化角度到 [-π, π]
 function normalize_angle(a::Float64)
     while a>π; a-=2π end
     while a<-π; a+=2π end
     return a
 end
 
-# EKF 预测：接受任意 AbstractMatrix
 function ekf_predict(x::Vector{Float64}, P::AbstractMatrix{Float64}, Δt::Float64, Q::AbstractMatrix{Float64})
     x_pred = f(x, Δt)
     F      = Jac_x_f(x, Δt)
@@ -276,7 +261,6 @@ function ekf_predict(x::Vector{Float64}, P::AbstractMatrix{Float64}, Δt::Float6
     return x_pred, P_pred
 end
 
-# EKF 更新：接受任意 AbstractMatrix
 function ekf_update(x::Vector{Float64}, P::AbstractMatrix{Float64}, z::Vector{Float64}, h::Function, H::Function, R::AbstractMatrix{Float64})
     z_pred = h(x)
     y = z .- z_pred
@@ -289,7 +273,6 @@ function ekf_update(x::Vector{Float64}, P::AbstractMatrix{Float64}, z::Vector{Fl
     return x_new, P_new
 end
 
-# 主循环：本地化
 function localization(meas_ch::Channel{MeasurementMessage}, state_ch::Channel{Tuple{Vector{Float64},Matrix{Float64}}}; dt_default=0.1)
     x_est = vcat([0.0,0.0,0.0], [1.0,0.0,0.0,0.0], [0.0,0.0,0.0], [0.0,0.0,0.0])
     P_est = Diagonal([1.0,1.0,1.0, 0.1,0.1,0.1,0.1, 0.5,0.5,0.5, 0.1,0.1,0.1])
@@ -315,7 +298,6 @@ function localization(meas_ch::Channel{MeasurementMessage}, state_ch::Channel{Tu
     end
 end
 
-# 状态向量转换
 function convert_state(x::Vector{Float64}, P::Matrix{Float64}, t::Float64)::MyLocalizationType
     return MyLocalizationType(true,
         SVector(x[1:3]...),
@@ -325,7 +307,6 @@ function convert_state(x::Vector{Float64}, P::Matrix{Float64}, t::Float64)::MyLo
         t)
 end
 
-# 包装函数：localize
 function localize(gps_ch::Channel{GPSMeasurement}, imu_ch::Channel{IMUMeasurement}, loc_ch::Channel{MyLocalizationType}, sd_ch::Channel{Bool}; dt_default=0.1)
     meas_ch  = Channel{MeasurementMessage}(32)
     state_ch = Channel{Tuple{Vector{Float64},Matrix{Float64}}}(32)
@@ -733,6 +714,8 @@ function decision_making(loc_ch, perc_ch, map::Dict{Int,VehicleSim.RoadSegment},
     speed_pid = PIDController(k_p_speed, k_i_speed, 0.0)
     
     prev_steering_angle = 0.0
+    stop_now = false
+    stop_counter = 0.0
     is_braking = false
     is_steering_adjustment = false
     STEERING_ERROR_THRESHOLD = 0.05
@@ -746,7 +729,7 @@ function decision_making(loc_ch, perc_ch, map::Dict{Int,VehicleSim.RoadSegment},
     s0 = find_current_segment(p0, map)
     route = least_lane_path(map, s0, target_seg)
     segs = [map[id] for id in route]
-    traj = generate_trajectory_plan(segs)
+    traj = generate_trajectory_plan(segs, target_seg)
     traj_points = [SVector{2}(p[1], p[2]) for p in traj]
 
     # put!(perc_ch, MyPerceptionType(time(), Detected_Obj[], ))
@@ -764,35 +747,108 @@ function decision_making(loc_ch, perc_ch, map::Dict{Int,VehicleSim.RoadSegment},
         end
 
         current_pos = SVector(loc.position[1], loc.position[2])
+        current_seg_id = find_current_segment(current_pos, map)
+        current_seg = map[current_seg_id]
         current_heading = loc.yaw
         current_speed = norm(SVector(loc.velocity[1], loc.velocity[2]))
         
+        #break if there is a car ahead
+        # ========================================
         obstacle_detected = false
         safe_distance = 35.0
         for obj in perc.detections
             if obj.classification == "vehicle"
                 rel_pos = obj.position - current_pos
-                if norm(rel_pos) ≤ safe_distance && abs(atan(rel_pos[2], rel_pos[1])) < π/4
+                rel_dist = norm(rel_pos)
+
+                angle_to_obj = atan(rel_pos[2], rel_pos[1])
+                heading_error = atan(sin(angle_to_obj - current_heading), cos(angle_to_obj - current_heading))
+
+                if abs(heading_error) < π/4 && rel_dist ≤ safe_distance
                     obstacle_detected = true
                     break
                 end
             end
         end
-        
+
         if obstacle_detected
+            @info "Detected vehicle in front within $safe_distance meters. Slowing down..."
             target_speed = 0.0
             speed_error = target_speed - current_speed
-            acceleration = clamp(speed_error * 2.0, -MAX_ACCEL, 0.0)
+            acceleration = 3*clamp(speed_error * 2.0, -MAX_ACCEL, 0.0)
             new_speed = max(current_speed + acceleration * dt *3, 0.0)
+            if new_speed < 0.05
+                serialize(sock, (0.0, 0.0, true))
+                @info "stop!"
+                sleep(dt)
+                continue
+            end
             serialize(sock, (0.0, new_speed, true))
             sleep(dt)
             continue
         end
 
+        #break if there is a stop sign
+        # ========================================
+        if current_seg ≠ nothing && stop_counter == 0
+            lb1 = current_seg.lane_boundaries[1]
+            lb2 = current_seg.lane_boundaries[2]
+            seg_end = 0.5 * (lb1.pt_b + lb2.pt_b)
+            dist_to_seg_end = norm(current_pos - seg_end) 
+            for i in 1:length(current_seg.lane_types)
+                if current_seg.lane_types[i] == VehicleSim.stop_sign && dist_to_seg_end < 10.0
+                    stop_now = true
+                end
+            end
+        end
+
+        if stop_now
+            @info "stop sigh here, $current_speed"
+            serialize(sock, (0.0, 0.0, true))
+            if current_speed < 0.001
+                @info "stop!"
+                sleep(1)
+                stop_now = false
+                stop_counter = 10.0
+            end
+            continue
+        end
+
+        if stop_counter > 0
+            stop_counter -= 0.01
+        end
+
+        #break if we arrive
+        # ========================================
         end_point = traj_points[end]
         distance_to_end = norm(current_pos - end_point)
         if !is_braking && distance_to_end ≤ 10.0
             is_braking = true
+            @info "start to break"
+        end
+
+        if is_braking
+            target_speed = if distance_to_end ≤ 10.0
+                0.0
+            else
+                lerp(current_speed, 0.0, (BRAKING_DISTANCE - distance_to_end)/5.0)
+            end
+
+            speed_error = target_speed - current_speed
+            acceleration = 1.5*clamp(speed_error * 2.0, -MAX_ACCEL, 0.0)
+            new_speed = current_speed + acceleration * dt
+            new_speed = max(new_speed, 0.0)
+
+            serialize(sock, (0.0, 0.0, true))
+
+            if new_speed ≤ 0.05
+                serialize(sock, (0.0, 0.0, false))
+                @info "stopped, end loop"
+                break
+            end
+
+            sleep(dt)
+            continue
         end
         
         lookahead_dist = 6.0
@@ -807,7 +863,6 @@ function decision_making(loc_ch, perc_ch, map::Dict{Int,VehicleSim.RoadSegment},
         alpha = alpha - 2π * floor((alpha + π) / (2π))
         
         if !is_steering_adjustment && abs(alpha) > STEERING_ERROR_THRESHOLD
-            @info "$(round(alpha, digits=3))"
             is_steering_adjustment = true
             speed_pid.integral = 0.0
         end
@@ -820,7 +875,6 @@ function decision_making(loc_ch, perc_ch, map::Dict{Int,VehicleSim.RoadSegment},
             desired_steering = atan(2 * wheelbase * sin(alpha) / lookahead_dist)
             
             if abs(alpha) ≤ STEERING_RECOVER_THRESHOLD
-                @info "转向调整完成"
                 is_steering_adjustment = false
             end
         else
@@ -828,7 +882,10 @@ function decision_making(loc_ch, perc_ch, map::Dict{Int,VehicleSim.RoadSegment},
             speed_error = target_speed - current_speed
             acceleration = pid_update(speed_pid, speed_error, dt)
             acceleration = clamp(acceleration, -MAX_ACCEL, MAX_ACCEL)
-            new_speed = clamp(current_speed + acceleration * dt, 0.0, MAX_SPEED)
+            if(stop_counter >3.0)
+                acceleration = acceleration * 10
+            end
+            new_speed = clamp(current_speed + acceleration * dt * 2, 0.0, MAX_SPEED)
             desired_steering = atan(2 * wheelbase * sin(alpha) / lookahead_dist)
         end
 
