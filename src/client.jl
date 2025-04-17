@@ -9,15 +9,6 @@ struct VehicleCommand
     controlled::Bool
 end
 
-function get_gt(msg::VehicleSim.MeasurementMessage, ego_id::Int)
-    for m in msg.measurements
-        if m isa VehicleSim.GroundTruthMeasurement && m.vehicle_id == ego_id
-            return m
-        end
-    end
-    error("No GroundTruthMeasurement for vehicle $ego_id")
-end
-
 function get_c()
     c = 'x'
     try
@@ -27,7 +18,15 @@ function get_c()
         ccall(:jl_tty_set_mode, Int32, (Ptr{Cvoid},Int32), stdin.handle, false)
     catch e
     end
-    c
+end
+
+function get_gt(msg::VehicleSim.MeasurementMessage, ego_id::Int)
+    for m in msg.measurements
+        if m isa VehicleSim.GroundTruthMeasurement && m.vehicle_id == ego_id
+            return m
+        end
+    end
+    error("No GroundTruthMeasurement for vehicle $ego_id")
 end
 
 function keyboard_client(host::IPAddr=IPv4(0), port=4444; v_step = 1.0, s_step = π/10)
@@ -108,7 +107,7 @@ function example_client(host::IPAddr=IPv4(0), port=4444)
 
     @async while isopen(socket)
         state_msg = deserialize(socket)
-    end
+    end 
    
     shutdown = false
     persist = true
@@ -122,77 +121,159 @@ function example_client(host::IPAddr=IPv4(0), port=4444)
         cmd = (0.0, 2.5, persist, shutdown)
         serialize(socket, cmd) 
     end
-
 end
 
-function auto_client(host::IPAddr = IPv4(0), port::Int = 4444; ego_id::Int = 1)
-    # Connect to the simulator server.
+# function auto_client(host::IPAddr=IPv4(0), port::Int=4444; ego_id::Int=1)
+#     sock = Sockets.connect(host, port)
+#     info_msg   = deserialize(sock)
+#     @info "Connected to simulator:" info_msg=info_msg
+
+#     # 先发一个零控制命令
+#     serialize(sock, (0.0, 0.5, true))
+#     @info "Sent initial zero command"
+
+#     # 通道初始化
+#     gps_ch      = Channel{GPSMeasurement}(32)
+#     imu_ch      = Channel{IMUMeasurement}(32)
+#     cam_ch      = Channel{CameraMeasurement}(32)           # 新增摄像头通道
+#     loc_ch      = Channel{MyLocalizationType}(32)
+#     perc_ch     = Channel{MyPerceptionType}(32)
+#     shutdown_ch = Channel{Bool}(1)
+
+#     # 启动本地化线程
+#     @info "Localize Starts"
+#     @async localize(gps_ch, imu_ch, loc_ch, shutdown_ch)
+#     @info "Localize Ends"
+
+#     # 启动感知线程，持续从 cam_ch 读取并产出 perc_ch
+#     @info "Perception Starts"
+#     @async perception(cam_ch, loc_ch, perc_ch, shutdown_ch)
+#     @info "Perception Ends"
+
+#     # 读 socket，分流到 GPS/IMU/CAM 通道
+#     errormonitor(@async begin
+#         while true
+#             if !isopen(sock)
+#                 @warn "Socket closed; exiting read loop."
+#                 break
+#             end
+#             msg = try
+#                 deserialize(sock)::VehicleSim.MeasurementMessage
+#             catch e
+#                 @warn "Failed to deserialize, retrying..." error=e
+#                 continue
+#             end
+
+#             for m in msg.measurements
+#                 if m isa GPSMeasurement
+#                     isready(gps_ch) && take!(gps_ch)
+#                     put!(gps_ch, m)
+#                 elseif m isa IMUMeasurement
+#                     isready(imu_ch) && take!(imu_ch)
+#                     put!(imu_ch, m)
+#                 elseif m isa CameraMeasurement
+#                     isready(cam_ch) && take!(cam_ch)
+#                     put!(cam_ch, m)
+#                 end
+#             end
+
+#             sleep(0.001)
+#         end
+#         put!(shutdown_ch, true)
+#     end)
+
+#     # 地图和目标
+#     map     = VehicleSim.city_map()
+#     targets = VehicleSim.identify_loading_segments(map)
+#     @assert !isempty(targets) "No loading segments found!"
+#     tgt = rand(targets)
+#     @info "Driving to target segment:" target_segment=tgt
+
+#     # 启动决策线程
+#     @async decision_making(loc_ch, perc_ch, map, tgt, sock)
+
+#     return nothing
+# end
+
+function auto_client(host::IPAddr=IPv4(0), port::Int=4444; ego_id::Int=1)
     sock = Sockets.connect(host, port)
     info_msg = deserialize(sock)
     @info "Connected to simulator:" info_msg=info_msg
 
-    # Send an initial zero command.
     serialize(sock, (0.0, 0.0, true))
     @info "Sent initial zero command"
 
-    # Create channels for incoming sensor measurements.
-    gps_channel = Channel{GPSMeasurement}(32)
-    imu_channel = Channel{IMUMeasurement}(32)
-    cam_channel = Channel{CameraMeasurement}(32)
+    loc_ch  = Channel{MyLocalizationType}(32)
+    perc_ch = Channel{MyPerceptionType}(32)
 
-    # Create channels for output states:
-    # loc_state_channel will receive the EKF localization output.
-    # perc_state_channel will receive the perception state.
-    loc_state_channel = Channel{MyLocalizationType}(32)
-    perc_state_channel = Channel{MyPerceptionType}(32)
+    errormonitor(@async begin
+        while true
+            if !isopen(sock)
+                @warn "Socket closed; exiting auto_client read loop."
+                break
+            end
 
-    # Launch an asynchronous task to continuously read MeasurementMessage from the socket 
-    # and distribute sensor measurements into the corresponding channels.
-    @async begin
-        while isopen(sock)
-            sleep(0.001)
             msg = try
                 deserialize(sock)::VehicleSim.MeasurementMessage
             catch e
                 @warn "AutoClient read loop: failed to deserialize, retrying..." error=e
                 continue
             end
-            for meas in msg.measurements
-                if meas isa GPSMeasurement
-                    put!(gps_channel, meas)
-                elseif meas isa IMUMeasurement
-                    put!(imu_channel, meas)
-                elseif meas isa CameraMeasurement
-                    put!(cam_channel, meas)
+
+            gt = nothing
+            try
+                gt = get_gt(msg, ego_id)
+            catch e
+                continue
+            end
+
+            if gt !== nothing
+                if(channel_full(loc_ch))
+                    take!(loc_ch)
                 end
-                # Note: Do not use ground truth measurements for localization/perception.
+
+                loc = MyLocalizationType(
+                    true,
+                    gt.position,
+                    VehicleSim.extract_yaw_from_quaternion(gt.orientation),
+                    gt.velocity,
+                    zeros(6,6),
+                    gt.time
+                )
+                put!(loc_ch, loc)
+
+                if(channel_full(perc_ch))
+                    take!(perc_ch)
+                end
+                detections = Detected_Obj[]
+                for m in msg.measurements
+                    if m isa GroundTruthMeasurement && m.vehicle_id != ego_id
+                        push!(detections, Detected_Obj(
+                            m.vehicle_id,
+                            (0.0, 0.0, 0.0, 0.0),
+                            1.0,
+                            "vehicle",
+                            m.position[1:2],
+                            m.velocity[1:2],
+                            zeros(2,2),
+                            "ground_truth"
+                        ))
+                    end
+                end
+                perc = MyPerceptionType(gt.time, detections)
+                put!(perc_ch, perc)
             end
         end
-    end
+        sleep(0.001)
+    end)
 
-    # Create a shutdown channel for the localization and perception modules.
-    shutdown_channel = Channel{Bool}(1)
-
-    # Launch the EKF localization module.
-    # 'localize' reads from gps_channel and imu_channel and outputs state into loc_state_channel.
-    @async localize(gps_channel, imu_channel, loc_state_channel, shutdown_channel)
-
-    # Launch the perception module.
-    # 'perception' reads from cam_channel (and can use loc_state_channel) to update perc_state_channel.
-    # Adjust parameters as needed (e.g. if perception requires ekf or cnn_model, supply them accordingly).
-    @async perception(cam_channel, loc_state_channel, perc_state_channel, shutdown_channel)
-
-    # Obtain the map and select a target road segment.
-    local map_segments = VehicleSim.city_map()
-    local targets = VehicleSim.identify_loading_segments(map_segments)
+    map = VehicleSim.city_map()
+    targets = VehicleSim.identify_loading_segments(map)
     @assert !isempty(targets) "No loading segments found in the map!"
-    local tgt = rand(targets)
+    tgt = rand(targets)
     @info "Driving to target segment:" target_segment=tgt
 
-    # Launch the decision making module,
-    # which will fetch the latest localization state from loc_state_channel (from EKF)
-    # and perception state from perc_state_channel to generate control commands.
-    @async decision_making(loc_state_channel, perc_state_channel, map_segments, tgt, sock)
+    @async decision_making(loc_ch, perc_ch, map, tgt, sock)
 end
 
 function channel_full(ch::Channel)
