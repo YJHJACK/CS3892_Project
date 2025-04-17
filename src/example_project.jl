@@ -794,7 +794,7 @@ function decision_making(loc_ch, perc_ch, map::Dict{Int,VehicleSim.RoadSegment},
     stop_counter = 0.0
     is_braking = false
     is_steering_adjustment = false
-    STEERING_ERROR_THRESHOLD = 0.05
+    STEERING_ERROR_THRESHOLD = 0.07
     STEERING_RECOVER_THRESHOLD = 0.03
     
     loc0 = fetch(loc_ch)
@@ -891,6 +891,11 @@ function decision_making(loc_ch, perc_ch, map::Dict{Int,VehicleSim.RoadSegment},
         if stop_counter > 0
             stop_counter -= 0.01
         end
+
+        if stop_counter < 1
+            stop_counter = 0
+        end
+        
         
         # ========================================
 
@@ -904,25 +909,10 @@ function decision_making(loc_ch, perc_ch, map::Dict{Int,VehicleSim.RoadSegment},
         end
 
         if is_braking
-            target_speed = if distance_to_end ≤ 5.0
-                0.0
-            else
-                lerp(current_speed, 0.0, (5.0 - distance_to_end)/5.0)
-            end
-
-            speed_error = target_speed - current_speed
-            acceleration = 1.5*clamp(speed_error * 2.0, -MAX_ACCEL, 0.0)
-            new_speed = current_speed + acceleration * dt
-            new_speed = max(new_speed, 0.0)
-
-            serialize(sock, (0.0, 0.0, true))
-
-            if new_speed ≤ STOP_SPEED_THRESHOLD
-                serialize(sock, (0.0, 0.0, false))
-                @info "stopped, end loop"
-                break
-            end
-
+            serialize(sock, (0.0, 0.0, false))
+            @info "stopped, end loop"
+            break
+            
             sleep(dt)
             continue
         end
@@ -939,7 +929,6 @@ function decision_making(loc_ch, perc_ch, map::Dict{Int,VehicleSim.RoadSegment},
         alpha = target_alpha
         alpha = alpha - 2π * floor((alpha + π) / (2π))
         
-        # 转向状态机
         if !is_steering_adjustment && abs(alpha) > STEERING_ERROR_THRESHOLD
             @info "$(round(alpha, digits=3))"
             is_steering_adjustment = true
@@ -953,8 +942,19 @@ function decision_making(loc_ch, perc_ch, map::Dict{Int,VehicleSim.RoadSegment},
             new_speed = max(current_speed + acceleration * dt, 0.0)
             desired_steering = atan(2 * wheelbase * sin(alpha) / lookahead_dist)
             
+            if !is_braking
+                new_speed = min(new_speed, 0.7)
+                if abs(alpha) < 0.2
+                    new_speed = 1.0
+                end
+            end
+            if stop_counter > 7
+                new_speed = 1.0
+            end
+            
+            
             if abs(alpha) ≤ STEERING_RECOVER_THRESHOLD
-                @info "转向调整完成"
+                @info "complete steering"
                 is_steering_adjustment = false
             end
         else
@@ -964,6 +964,9 @@ function decision_making(loc_ch, perc_ch, map::Dict{Int,VehicleSim.RoadSegment},
             acceleration = clamp(acceleration, -MAX_ACCEL, MAX_ACCEL)
             
             new_speed = clamp(current_speed + acceleration * dt, 0.0, MAX_SPEED)
+            if !is_braking
+                new_speed = max(new_speed, 2.0)
+            end
             desired_steering = atan(2 * wheelbase * sin(alpha) / lookahead_dist)
         end
 
