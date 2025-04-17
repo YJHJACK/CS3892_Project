@@ -279,3 +279,93 @@ end
 function channel_full(ch::Channel)
     length(ch.data) ≥ ch.sz_max
 end
+
+function auto_client_no_gt(host::IPAddr=IPv4(0), port::Int=4444; ego_id::Int=1)
+    sock       = connect(host, port)
+    info_msg   = deserialize(sock)
+    msg0 = deserialize(sock)::VehicleSim.MeasurementMessage
+    @info "Connected to simulator:" info_msg=info_msg
+
+    serialize(sock, (0.0, 0.0, true))
+    @info "Sent initial zero command"
+
+    # 1) Extract the first GT and prime loc_ch
+    gt0 = nothing
+    while gt0 === nothing
+        let m = deserialize(sock)::VehicleSim.MeasurementMessage
+            gt0 = try
+                get_gt(m, ego_id)
+            catch
+                nothing
+            end
+        end
+    end
+    init_loc = MyLocalizationType(
+      true,
+      gt0.position,
+      VehicleSim.extract_yaw_from_quaternion(gt0.orientation),
+      gt0.velocity,                 # <-- use the real GT velocity here
+      zeros(6,6),
+      gt0.time
+    )
+    @info "set up initial velocity"
+
+    gps_ch      = Channel{GPSMeasurement}(32)
+    imu_ch      = Channel{IMUMeasurement}(32)
+    cam_ch      = Channel{CameraMeasurement}(32)           
+    loc_ch      = Channel{MyLocalizationType}(32)
+    perc_ch     = Channel{MyPerceptionType}(32)
+    shutdown_ch = Channel{Bool}(1)
+
+    put!(loc_ch, init_loc)
+
+    @info "Localize Starts"
+    @async localize(gps_ch, imu_ch, loc_ch, shutdown_ch)
+    @info "Localize Ends"
+
+    @info "Perception Starts"
+    @async perception(cam_ch, loc_ch, perc_ch, shutdown_ch)
+    @info "Perception Ends"
+
+    errormonitor(@async begin
+        while true
+            if !isopen(sock)
+                @warn "Socket closed; exiting read loop."
+                break
+            end
+            msg = try
+                deserialize(sock)::VehicleSim.MeasurementMessage
+            catch e
+                @warn "Failed to deserialize, retrying..." error=e
+                continue
+            end
+
+            for m in msg.measurements
+                if m isa GPSMeasurement
+                    isready(gps_ch) && take!(gps_ch)
+                    put!(gps_ch, m)
+                elseif m isa IMUMeasurement
+                    isready(imu_ch) && take!(imu_ch)
+                    put!(imu_ch, m)
+                elseif m isa CameraMeasurement
+                    isready(cam_ch) && take!(cam_ch)
+                    put!(cam_ch, m)
+                end
+            end
+
+            sleep(0.001)
+        end
+        put!(shutdown_ch, true)
+    end)
+
+    map     = VehicleSim.city_map()
+    targets = VehicleSim.identify_loading_segments(map)
+    @assert !isempty(targets) "No loading segments found!"
+    tgt = rand(targets)
+    @info "Driving to target segment:" target_segment=tgt
+
+    @async decision_making(loc_ch, perc_ch, map, tgt, sock)
+
+    return nothing
+end
+
