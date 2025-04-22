@@ -123,93 +123,15 @@ function example_client(host::IPAddr=IPv4(0), port=4444)
     end
 end
 
-# function auto_client(host::IPAddr=IPv4(0), port::Int=4444; ego_id::Int=1)
-#     sock = Sockets.connect(host, port)
-#     info_msg   = deserialize(sock)
-#     @info "Connected to simulator:" info_msg=info_msg
-
-#     # 先发一个零控制命令
-#     serialize(sock, (0.0, 0.5, true))
-#     @info "Sent initial zero command"
-
-#     # 通道初始化
-#     gps_ch      = Channel{GPSMeasurement}(32)
-#     imu_ch      = Channel{IMUMeasurement}(32)
-#     cam_ch      = Channel{CameraMeasurement}(32)           # 新增摄像头通道
-#     loc_ch      = Channel{MyLocalizationType}(32)
-#     perc_ch     = Channel{MyPerceptionType}(32)
-#     shutdown_ch = Channel{Bool}(1)
-
-#     # 启动本地化线程
-#     @info "Localize Starts"
-#     @async localize(gps_ch, imu_ch, loc_ch, shutdown_ch)
-#     @info "Localize Ends"
-
-#     # 启动感知线程，持续从 cam_ch 读取并产出 perc_ch
-#     @info "Perception Starts"
-#     @async perception(cam_ch, loc_ch, perc_ch, shutdown_ch)
-#     @info "Perception Ends"
-
-#     # 读 socket，分流到 GPS/IMU/CAM 通道
-#     errormonitor(@async begin
-#         while true
-#             if !isopen(sock)
-#                 @warn "Socket closed; exiting read loop."
-#                 break
-#             end
-#             msg = try
-#                 deserialize(sock)::VehicleSim.MeasurementMessage
-#             catch e
-#                 @warn "Failed to deserialize, retrying..." error=e
-#                 continue
-#             end
-
-#             for m in msg.measurements
-#                 if m isa GPSMeasurement
-#                     isready(gps_ch) && take!(gps_ch)
-#                     put!(gps_ch, m)
-#                 elseif m isa IMUMeasurement
-#                     isready(imu_ch) && take!(imu_ch)
-#                     put!(imu_ch, m)
-#                 elseif m isa CameraMeasurement
-#                     isready(cam_ch) && take!(cam_ch)
-#                     put!(cam_ch, m)
-#                 end
-#             end
-
-#             sleep(0.001)
-#         end
-#         put!(shutdown_ch, true)
-#     end)
-
-#     # 地图和目标
-#     map     = VehicleSim.city_map()
-#     targets = VehicleSim.identify_loading_segments(map)
-#     @assert !isempty(targets) "No loading segments found!"
-#     tgt = rand(targets)
-#     @info "Driving to target segment:" target_segment=tgt
-
-#     # 启动决策线程
-#     @async decision_making(loc_ch, perc_ch, map, tgt, sock)
-
-#     return nothing
-# end
-
-
+##### Version for Closing the Ground Truth ####
 # function auto_client(host::IPAddr = IPv4(0), port::Int = 4444; ego_id::Int = 1)
-#     ########################################################################
-#     # 0. 连接模拟器，保持静止
-#     ########################################################################
 #     sock = Sockets.connect(host, port)
 #     info_msg = deserialize(sock)
 #     @info "Connected to simulator" info_msg = info_msg
 
-#     serialize(sock, (0.0, 0.0, true))     # 第一道指令：停在原地
+#     serialize(sock, (0.0, 0.0, true))
 #     @info "Sent initial zero‑speed command"
 
-#     ########################################################################
-#     # 1. 各类 Channel
-#     ########################################################################
 #     gps_ch      = Channel{GPSMeasurement}(32)
 #     imu_ch      = Channel{IMUMeasurement}(32)
 #     cam_ch      = Channel{CameraMeasurement}(32)
@@ -217,15 +139,10 @@ end
 #     perc_ch     = Channel{MyPerceptionType}(32)
 #     sd_ch       = Channel{Bool}(1)
 
-#     ########################################################################
-#     # 2. 后台线程：EKF + 感知
-#     ########################################################################
+
 #     errormonitor(@async localize(gps_ch, imu_ch, loc_ch, sd_ch))
 #     errormonitor(@async perception(cam_ch, loc_ch, perc_ch, sd_ch))
 
-#     ########################################################################
-#     # 3. 后台线程：读取 socket → 推送最新测量
-#     ########################################################################
 #     put_latest!(ch, v) = (isready(ch) && take!(ch); put!(ch, v))
 
 #     errormonitor(@async begin
@@ -245,16 +162,13 @@ end
 #         put!(sd_ch, true)
 #     end)
 
-#     ########################################################################
-#     # 4. 等 EKF 第一帧定位；未就绪时持续发 0 速
-#     ########################################################################
 #     t_start   = time()
 #     loc0      = nothing
 #     wait_time = 0.0
 #     while loc0 === nothing && isopen(sock)
 #         if isready(loc_ch)
-#             loc0 = take!(loc_ch)          # 取出 EKF 的第一帧
-#             put!(loc_ch, loc0)            # 放回去，让 planner 能拿到
+#             loc0 = take!(loc_ch)
+#             put!(loc_ch, loc0)
 #             break
 #         end
 #         serialize(sock, (0.0, 0.0, true))
@@ -262,16 +176,12 @@ end
 #         wait_time = time() - t_start
 #         if wait_time > 3.0
 #             @warn "EKF has not produced a state after 3 s; still waiting…"
-#             t_start = time()              # 重新计时，继续等
+#             t_start = time()
 #         end
 #     end
 #     loc0 === nothing && error("Socket closed before EKF initialized.")
 
 #     @info "EKF ready after $(round(wait_time, digits = 2)) s — planner starting"
-
-#     ########################################################################
-#     # 5. 生成目标并启动决策线程
-#     ########################################################################
 #     map     = VehicleSim.city_map()
 #     tgt     = rand(VehicleSim.identify_loading_segments(map))
 #     @info "Driving to target segment:" target_segment = tgt
@@ -280,7 +190,7 @@ end
 #     return nothing
 # end
 
-
+##### Version for Openning the Ground Truth ####
 function auto_client(host::IPAddr=IPv4(0), port::Int=4444; ego_id::Int=1)
     sock = Sockets.connect(host, port)
     info_msg = deserialize(sock)
