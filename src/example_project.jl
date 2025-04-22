@@ -268,83 +268,101 @@ function process_gt(gt_ch, sd_ch, loc_ch, perc_ch)
     end
 end
 
-function normalize_angle(a::Float64)
-    while a>π; a-=2π end
-    while a<-π; a+=2π end
-    return a
+normalize_quat!(x) = (q = x[4:7]; x[4:7] .= q ./ norm(q))
+
+h_imu(x) = vcat(x[8:10], x[11:13])
+
+function Jac_h_imu(x)
+    J = zeros(6,13)
+    J[1:3,8:10]  .= I(3)
+    J[4:6,11:13] .= I(3)
+    return J
 end
 
-function ekf_predict(x::Vector{Float64}, P::AbstractMatrix{Float64}, Δt::Float64, Q::AbstractMatrix{Float64})
-    x_pred = f(x, Δt)
-    F      = Jac_x_f(x, Δt)
-    P_pred = F*P*F' + Q
+function ekf_predict(x, P, Δt, Q)
+    x_pred        = f(x, Δt)
+    normalize_quat!(x_pred)
+    F             = Jac_x_f(x, Δt)
+    P_pred        = F*P*F' + Q
     return x_pred, P_pred
 end
 
-function ekf_update(x::Vector{Float64}, P::AbstractMatrix{Float64}, z::Vector{Float64}, h::Function, H::Function, R::AbstractMatrix{Float64})
-    z_pred = h(x)
-    y = z .- z_pred
-    if length(y)≥3; y[3]=normalize_angle(y[3]); end
-    Hx = H(x)
-    S = Hx*P*Hx' + R
-    K = P*Hx'*inv(S)
-    x_new = x + K*y
-    P_new = (I - K*Hx)*P
-    return x_new, P_new
+function ekf_update!(x, P, z, h, H, R)
+    y   = z .- h(x)
+    length(y) ≥ 3 && (y[3] = normalize_angle(y[3]))
+    Hx  = H(x)
+    S   = Hx*P*Hx' + R
+    K   = P*Hx'*inv(S)
+    x  .= x + K*y
+    P  .= (I - K*Hx)*P
+    normalize_quat!(x)
 end
 
-function localization(meas_ch::Channel{MeasurementMessage}, state_ch::Channel{Tuple{Vector{Float64},Matrix{Float64}}}; dt_default=0.1)
-    x_est = vcat([0.0,0.0,0.0], [1.0,0.0,0.0,0.0], [0.0,0.0,0.0], [0.0,0.0,0.0])
-    P_est = Diagonal([1.0,1.0,1.0, 0.1,0.1,0.1,0.1, 0.5,0.5,0.5, 0.1,0.1,0.1])
-    Q     = Diagonal([0.3,0.3,0.3, 0.005,0.005,0.005,0.005, 0.2,0.2,0.2, 0.02,0.02,0.02])
-    Rgps  = Diagonal([0.5,0.5,0.05])
-    last_time = time()
+function localization(meas_ch::Channel{MeasurementMessage},
+                      state_ch::Channel{Tuple{Vector{Float64},Matrix{Float64}}};
+                      dt_default = 0.1)
+
+    x_est = vcat([0,0,0], [1,0,0,0], zeros(6))
+    P_est = Diagonal([1,1,1, 0.1,0.1,0.1,0.1, 0.5,0.5,0.5, 0.1,0.1,0.1])
+    Q     = Diagonal([0.3,0.3,0.3, 0.005,0.005,0.005,0.005,
+                      0.2,0.2,0.2, 0.02,0.02,0.02])
+
+    last_t = time()
+
     while true
         msg = take!(meas_ch)
-        t = isempty(msg.measurements) ? time() : msg.measurements[1].time
-        Δt = max(t - last_time, dt_default)
-        last_time = t
+        t   = isempty(msg.measurements) ? time() : msg.measurements[1].time
+        Δt  = max(t - last_t, dt_default)
+        last_t = t
+
         x_pred, P_pred = ekf_predict(x_est, P_est, Δt, Q)
-        x_upd, P_upd = x_pred, P_pred
+
         for m in msg.measurements
             if m isa GPSMeasurement
                 z = [m.lat, m.long, m.heading]
-                x_upd, P_upd = ekf_update(x_upd, P_upd, z, h_gps, Jac_h_gps, Rgps)
+                ekf_update!(x_pred, P_pred, z, h_gps, Jac_h_gps, R_gps)
+            elseif m isa IMUMeasurement
+                z = vcat(m.linear_vel, m.angular_vel)
+                ekf_update!(x_pred, P_pred, z, h_imu,  Jac_h_imu, R_imu)
             end
         end
-        x_est, P_est = x_upd, P_upd
-        put!(state_ch, (x_est, Matrix(P_est)))
-        sleep(0.001)
+
+        put!(state_ch, (copy(x_pred), Matrix(P_pred)))
+        x_est, P_est = x_pred, P_pred
+        sleep(0.0005)
     end
 end
 
-function convert_state(x::Vector{Float64}, P::Matrix{Float64}, t::Float64)::MyLocalizationType
-    return MyLocalizationType(true,
-        SVector(x[1:3]...),
-        extract_yaw_from_quaternion(x[4:7]),
-        SVector(x[8:10]...),
-        P,
-        t)
-end
+function localize(gps_ch::Channel{GPSMeasurement},
+                  imu_ch::Channel{IMUMeasurement},
+                  loc_ch::Channel{MyLocalizationType},
+                  sd_ch::Channel{Bool};
+                  dt_default = 0.1)
 
-function localize(gps_ch::Channel{GPSMeasurement}, imu_ch::Channel{IMUMeasurement}, loc_ch::Channel{MyLocalizationType}, sd_ch::Channel{Bool}; dt_default=0.1)
     meas_ch  = Channel{MeasurementMessage}(32)
     state_ch = Channel{Tuple{Vector{Float64},Matrix{Float64}}}(32)
-    errormonitor(@async localization(meas_ch, state_ch; dt_default=dt_default))
+    @async localization(meas_ch, state_ch; dt_default)
+
     while true
+
         if isready(sd_ch) && take!(sd_ch)
-            close(meas_ch); close(state_ch); break
+            break
         end
-        gps_msgs = GPSMeasurement[]
-        while isready(gps_ch); push!(gps_msgs, take!(gps_ch)); end
-        if !isempty(gps_msgs)
-            put!(meas_ch, MeasurementMessage(1,0,gps_msgs))
+
+        gps_buf = GPSMeasurement[]; imu_buf = IMUMeasurement[]
+        while isready(gps_ch); push!(gps_buf, take!(gps_ch)); end
+        while isready(imu_ch); push!(imu_buf, take!(imu_ch)); end
+
+        if !isempty(gps_buf) || !isempty(imu_buf)
+            put!(meas_ch, MeasurementMessage(1, 0, vcat(gps_buf, imu_buf)))
         end
+
         if isready(state_ch)
             xv, Pv = take!(state_ch)
             put!(loc_ch, convert_state(xv, Pv, time()))
         end
-        sleep(0.005)
+
+        sleep(0.002)
     end
 end
 
