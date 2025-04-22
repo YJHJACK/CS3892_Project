@@ -700,7 +700,7 @@ function perception(cam_meas_channel, localization_state_channel, perception_sta
         # update particles
         delta_t = time() - last_time
         last_time = time()
-        updated_particles = update_particles(particles, delta_t,
+        particles = update_particles(particles, delta_t,
                                          b1, b2,
                                          ego_orientation, ego_position,
                                          T_body_camrot1, T_body_camrot2,
