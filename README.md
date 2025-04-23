@@ -8,7 +8,7 @@ This project is implemented in **Julia** and built on top of [VehicleSim](https:
 
 ## Project Overview
 
-The core autonomous driving pipeline is located in the `example_project` file and includes the following modules:
+The core autonomous driving pipeline is located in the `src/example_project.jl` file and includes the following modules:
 
 ### Path Planning
 
