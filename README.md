@@ -1,10 +1,23 @@
+“oTTo Autonomous Vehicle Group Projects with VehicleSim“
 
-oTTo Autonomous Vehicle Group Projects with VehicleSim
 
-This project is built on top of VehicleSim, a lightweight and modular simulation framework for developing and testing autonomous vehicle systems.
+This project is implemented in Julia and built on top of VehicleSim, a lightweight and modular simulation framework designed by VAMPIR Lab for developing and testing autonomous vehicle algorithms in a controlled virtual environment.
 
-We implemented a basic autonomous driving pipeline inside the example_project folder, which includes path planning, localization, and perception. The path planning module generates a drivable trajectory using BFS to find a route through the simulated road network. The localization module uses an Extended Kalman Filter (EKF) to estimate the vehicle’s position and velocity by fusing noisy GPS and IMU data. The perception module detects and tracks nearby vehicles using camera data and a particle filter for robust pose estimation.
+Project Overview
+The core autonomous driving pipeline is located in the example_project folder. It includes:
 
-Testing scripts are provided in the test directory, including evaluation setups for both localization and perception. These tests help validate the accuracy and stability of each module independently.
+Path Planning
+A route is computed using Breadth-First Search (BFS) to determine the optimal sequence of road segments from the start point to the destination. The resulting trajectory is smoothed and resampled for the vehicle to follow.
 
-Note: While the algorithms for localization and perception have been verified to work correctly, we observed issues related to channel communication during integration. Specifically, after disabling the ground truth data, the system sometimes fails to retrieve valid sensor input due to OS-level synchronization delays. These problems are not due to flaws in the algorithms themselves, but rather from lower-level communication timing.
+Localization
+We use an Extended Kalman Filter (EKF) to fuse noisy GPS and IMU sensor data, providing a stable estimate of the ego vehicle’s 3D position, velocity, and orientation over time.
+
+Perception
+Nearby vehicles are detected using stereo camera data. A combination of bounding box matching and a particle filter is used to estimate the positions and headings of dynamic obstacles.
+
+Testing
+Testing scripts are provided in the test/ folder, including evaluation setups for both localization and perception. These tests can be used to validate the accuracy and robustness of each module independently.
+
+Known Issues
+Although the localization and perception algorithms perform correctly in isolated tests, integration revealed channel communication issues—especially after disabling ground truth input. This is likely due to OS-level synchronization delays or stale data in inter-process channels. These are implementation-level issues and do not affect the correctness of the underlying algorithms.
+
