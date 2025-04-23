@@ -1,5 +1,6 @@
 “oTTo Autonomous Vehicle Group Projects with VehicleSim“
 
+VehicleSim: https://github.com/VAMPIR-Lab/VehicleSim
 
 This project is implemented in Julia and built on top of VehicleSim, a lightweight and modular simulation framework designed by VAMPIR Lab for developing and testing autonomous vehicle algorithms in a controlled virtual environment.
 
@@ -20,4 +21,5 @@ Testing scripts are provided in the test/ folder, including evaluation setups fo
 
 Known Issues
 Although the localization and perception algorithms perform correctly in isolated tests, integration revealed channel communication issues—especially after disabling ground truth input. This is likely due to OS-level synchronization delays or stale data in inter-process channels. These are implementation-level issues and do not affect the correctness of the underlying algorithms.
+
 
